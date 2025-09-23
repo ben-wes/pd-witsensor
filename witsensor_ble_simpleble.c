@@ -111,9 +111,6 @@ static void* _scan_stop_thread(void *arg) {
 #ifdef __APPLE__
 #include <dispatch/dispatch.h>
 typedef void (*ble_main_fn)(void *);
-static void ble_main_async(ble_main_fn fn, void *ctx) {
-    dispatch_async_f(dispatch_get_main_queue(), ctx, fn);
-}
 static void ble_main_after_ms(uint64_t delay_ms, ble_main_fn fn, void *ctx) {
     dispatch_time_t when = dispatch_time(DISPATCH_TIME_NOW, (int64_t)delay_ms * 1000000LL);
     dispatch_after_f(when, dispatch_get_main_queue(), ctx, fn);
@@ -162,23 +159,6 @@ static void _enumerate_results_mac(witsensor_ble_simpleble_t *ble) {
 }
 #endif
 
-// Delayed scan function to avoid GUI threading issues
-static void witsensor_ble_simpleble_scan_delayed(witsensor_ble_simpleble_t *ble_data) {
-    if (!ble_data) return;
-    
-    post("WITSensorBLE: Starting scan...");
-    if (!witsensor_ble_simpleble_ensure_initialized(ble_data)) {
-        post("WITSensorBLE: Failed to initialize BLE system for scan");
-        return;
-    }
-    _clear_cached_results(ble_data);
-    ble_data->is_scanning = 1;
-    simpleble_adapter_scan_for(ble_data->adapter, 4000);
-    ble_data->is_scanning = 0;
-#ifdef __APPLE__
-    _enumerate_results_mac(ble_data);
-#endif
-}
 
 // Helpers to manage cached scan results (CoreBluetooth thread safe: no Pd calls)
 static void _clear_cached_results(witsensor_ble_simpleble_t *ble) {
@@ -265,15 +245,6 @@ static void simpleble_on_scan_found(simpleble_adapter_t adapter, simpleble_perip
     if (id) simpleble_free(id);
 }
 
-static void simpleble_on_connected(void *user_data, void *peripheral) {
-    (void)peripheral; (void)user_data;
-    post("WITSensorBLE: Connected to device");
-}
-
-static void simpleble_on_disconnected(void *user_data, void *peripheral) {
-    (void)peripheral; (void)user_data;
-    post("WITSensorBLE: Disconnected from device");
-}
 
 static void simpleble_on_data_received(simpleble_peripheral_t peripheral, simpleble_uuid_t service, simpleble_uuid_t characteristic, const uint8_t *data, size_t length, void *user_data) {
     (void)peripheral; (void)service; (void)characteristic;
