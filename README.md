@@ -1,14 +1,14 @@
 ## WIT Sensor Pure Data External
 
-Pure Data external for WIT BWT901 BLE sensors. macOS build uses SimpleBLE (static) today; broader cross‑platform support is in progress.
+Pure Data external for WIT BWT901 BLE sensors. macOS build uses SimpleBLE (static)
 
 ### Status
 
 | Platform | Backend | Status |
 | --- | --- | --- |
-| macOS | SimpleBLE (+ small Obj‑C auth helper) | Working (active dev) |
-| Linux | SimpleBLE | Experimental (builds, untested) |
-| Windows | SimpleBLE | Experimental (builds, untested) |
+| macOS | SimpleBLE (+ small Obj‑C auth helper) | tested |
+| Linux | SimpleBLE | experimental |
+| Windows | SimpleBLE | not yet available |
 
 ### Clone
 
@@ -28,7 +28,7 @@ git submodule update --init --recursive
 make deps && make
 ```
 
-Note: On macOS we link SimpleBLE statically; on Linux/Windows we use the shared build tree. The same commands above handle both.
+Note: On macOS we link SimpleBLE statically; on Linux we use the shared build tree. The same commands above handle both.
 
 ### Usage (Pd)
 
@@ -44,7 +44,6 @@ Note: On macOS we link SimpleBLE statically; on Linux/Windows we use the shared 
 
 - Implementation: `witsensor_ble_simpleble.c` (C, SimpleBLE). Small `macos_bt_auth.m` helper for Bluetooth permission/auth prompts.
 - Build system: `Makefile` integrates SimpleBLE builds (`make deps`).
-- Goals: unify Linux/Windows builds via the same SimpleBLE path.
 
 ### License
 
