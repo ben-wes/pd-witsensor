@@ -1,4 +1,4 @@
-## WIT Sensor Pure Data External
+## [witsensor] Pure Data External
 
 Pure Data external for WIT BWT901 BLE sensors. macOS build uses SimpleBLE (static)
 
