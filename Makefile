@@ -61,7 +61,7 @@ macos_bt_auth.darwin-arm64-64.so.o: macos_bt_auth.m
 
 # Build rule for generic pd_darwin extension (local builds)
 macos_bt_auth.pd_darwin.o: macos_bt_auth.m
-	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -arch arm64 -mmacosx-version-min=10.6 -c macos_bt_auth.m -o macos_bt_auth.pd_darwin.o
+	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -mmacosx-version-min=10.6 -c macos_bt_auth.m -o macos_bt_auth.pd_darwin.o
 
 # SimpleBLE dependencies (build static for macOS and shared for Linux)
 SIMPLEBLE_DIR=SimpleBLE/simplecble
