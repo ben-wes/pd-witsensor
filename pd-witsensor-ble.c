@@ -20,7 +20,7 @@
 #include "witsensor_ble_simpleble.h"
 
 #define WITSENSOR_MAJOR_VERSION 0
-#define WITSENSOR_MINOR_VERSION 2
+#define WITSENSOR_MINOR_VERSION 1
 #define WITSENSOR_BUGFIX_VERSION 0
 
 #define MAX_DEVICES 20

@@ -238,6 +238,7 @@ static void simpleble_on_scan_stop(simpleble_adapter_t adapter, void *user_data)
 }
 
 static void simpleble_on_scan_found(simpleble_adapter_t adapter, simpleble_peripheral_t peripheral, void *user_data) {
+    (void)adapter;
     witsensor_ble_simpleble_t *ble_data = (witsensor_ble_simpleble_t *)user_data;
     if (!ble_data || !peripheral) return;
     simpleble_peripheral_t p = peripheral;
@@ -263,135 +264,87 @@ static void simpleble_on_scan_found(simpleble_adapter_t adapter, simpleble_perip
 }
 
 static void simpleble_on_connected(void *user_data, void *peripheral) {
-    witsensor_ble_simpleble_t *ble_data = (witsensor_ble_simpleble_t *)user_data;
+    (void)peripheral; (void)user_data;
     post("WITSensorBLE: Connected to device");
 }
 
 static void simpleble_on_disconnected(void *user_data, void *peripheral) {
-    witsensor_ble_simpleble_t *ble_data = (witsensor_ble_simpleble_t *)user_data;
+    (void)peripheral; (void)user_data;
     post("WITSensorBLE: Disconnected from device");
 }
 
 static void simpleble_on_data_received(simpleble_peripheral_t peripheral, simpleble_uuid_t service, simpleble_uuid_t characteristic, const uint8_t *data, size_t length, void *user_data) {
+    (void)peripheral; (void)service; (void)characteristic;
     witsensor_ble_simpleble_t *ble_data = (witsensor_ble_simpleble_t *)user_data;
     if (!ble_data) return;
     
-        // Parse WIT sensor data (from Python SDK)
-        if (length >= 20) { // WIT sensor packet length
-            // Check for WIT sensor packet header (0x55)
-            if (data[0] == 0x55) {
-                unsigned char packet_type = data[1];
-                
-                switch (packet_type) {
-                    case 0x61: // Accelerometer, Gyroscope, and Angle data (20 bytes)
-                        if (length >= 20) {
-                            // Parse accelerometer data (like Python SDK)
-                            int16_t ax = get_signed_int16(data[3] << 8 | data[2]);
-                            int16_t ay = get_signed_int16(data[5] << 8 | data[4]);
-                            int16_t az = get_signed_int16(data[7] << 8 | data[6]);
-                            
-                            // Parse gyroscope data
-                            int16_t gx = get_signed_int16(data[9] << 8 | data[8]);
-                            int16_t gy = get_signed_int16(data[11] << 8 | data[10]);
-                            int16_t gz = get_signed_int16(data[13] << 8 | data[12]);
-                            
-                            // Parse angle data
-                            int16_t ang_x = get_signed_int16(data[15] << 8 | data[14]);
-                            int16_t ang_y = get_signed_int16(data[17] << 8 | data[16]);
-                            int16_t ang_z = get_signed_int16(data[19] << 8 | data[18]);
-                            
-                            // Scale data like Python SDK (acceleration back to original scaling)
-                            float accel_x = (float)ax / 32768.0f * 16.0f;
-                            float accel_y = (float)ay / 32768.0f * 16.0f;
-                            float accel_z = (float)az / 32768.0f * 16.0f;
-                            
-                            // Debug: Check if values are reasonable (accel: -16 to +16g, gyro: -200 to +200 deg/s)
-                            if (accel_x > 20.0f || accel_x < -20.0f || accel_y > 20.0f || accel_y < -20.0f || accel_z > 20.0f || accel_z < -20.0f) {
-                                post("WITSensorBLE: DEBUG - Raw accel values: ax=%d, ay=%d, az=%d", ax, ay, az);
-                                post("WITSensorBLE: DEBUG - Scaled accel values: x=%.3f, y=%.3f, z=%.3f", accel_x, accel_y, accel_z);
-                            }
-                            
-                            // Scale gyroscope data (normalized to reasonable range)
-                            float gyro_x = (float)gx / 32768.0f * 200.0f;  // Reduced from 2000 to 200
-                            float gyro_y = (float)gy / 32768.0f * 200.0f;  // Reduced from 2000 to 200
-                            float gyro_z = (float)gz / 32768.0f * 200.0f;  // Reduced from 2000 to 200
-                            
-                            float angle_x = (float)ang_x / 32768.0f * 180.0f;
-                            float angle_y = (float)ang_y / 32768.0f * 180.0f;
-                            float angle_z = (float)ang_z / 32768.0f * 180.0f;
-                            
-                            // Call data callback to send to Pure Data outlets
-                            if (ble_data->data_callback) {
-                                // Create a data structure with scaled values
-                                // 1 byte type + 9 floats × 4 bytes = 37 bytes total
-                                unsigned char callback_data[37];
-                                callback_data[0] = 0x61; // Packet type
-                                
-                                // Store scaled values as floats (4 bytes each)
-                                float *data_ptr = (float*)(callback_data + 1);
-                                data_ptr[0] = accel_x;
-                                data_ptr[1] = accel_y;
-                                data_ptr[2] = accel_z;
-                                data_ptr[3] = gyro_x;
-                                data_ptr[4] = gyro_y;
-                                data_ptr[5] = gyro_z;
-                                data_ptr[6] = angle_x;
-                                data_ptr[7] = angle_y;
-                                data_ptr[8] = angle_z;
-                                
-                                ble_data->data_callback(ble_data->pd_obj, callback_data, 37);
-                            }
-                        }
-                        break;
-                        
-                    case 0x71: // Magnetic field and Quaternion data (20-40 bytes)
-                        if (length >= 20) {
-                            // Check if it's magnetic field data (register 0x3A)
-                            if (data[2] == 0x3A && length >= 20) {
-                                int16_t hx = get_signed_int16(data[5] << 8 | data[4]);
-                                int16_t hy = get_signed_int16(data[7] << 8 | data[6]);
-                                int16_t hz = get_signed_int16(data[9] << 8 | data[8]);
-                                
-                                // Scale magnetic field data like Python SDK
-                                float mag_x = (float)hx / 120.0f;
-                                float mag_y = (float)hy / 120.0f;
-                                float mag_z = (float)hz / 120.0f;
-                            }
-                            // Check if it's quaternion data (register 0x51)
-                            else if (data[2] == 0x51 && length >= 20) {
-                                int16_t q0 = get_signed_int16(data[5] << 8 | data[4]);
-                                int16_t q1 = get_signed_int16(data[7] << 8 | data[6]);
-                                int16_t q2 = get_signed_int16(data[9] << 8 | data[8]);
-                                int16_t q3 = get_signed_int16(data[11] << 8 | data[10]);
-                                
-                                // Scale quaternion data like Python SDK
-                                float quat_w = (float)q0 / 32768.0f;
-                                float quat_x = (float)q1 / 32768.0f;
-                                float quat_y = (float)q2 / 32768.0f;
-                                float quat_z = (float)q3 / 32768.0f;
-                                
-                                // Call data callback for quaternion data
-                                if (ble_data->data_callback) {
-                                    unsigned char callback_data[17];
-                                    callback_data[0] = 0x71; // Packet type
-                                    
-                                    // Store quaternion values as floats
-                                    float *data_ptr = (float*)(callback_data + 1);
-                                    data_ptr[0] = quat_w;
-                                    data_ptr[1] = quat_x;
-                                    data_ptr[2] = quat_y;
-                                    data_ptr[3] = quat_z;
-                                    
-                                    ble_data->data_callback(ble_data->pd_obj, callback_data, 17);
-                                }
-                            }
-                        }
-                        break;
-                        
-                    default:
-                        post("WITSensorBLE: Unknown packet type: 0x%02X", packet_type);
-                        break;
+        // Parse WIT sensor data
+        if (length >= 20 && data[0] == 0x55) {
+            unsigned char packet_type = data[1];
+
+            switch (packet_type) {
+                case 0x61: { // Accel, Gyro, Angles
+                    // Accel
+                    int16_t ax = get_signed_int16(data[3] << 8 | data[2]);
+                    int16_t ay = get_signed_int16(data[5] << 8 | data[4]);
+                    int16_t az = get_signed_int16(data[7] << 8 | data[6]);
+                    float accel_x = (float)ax / 32768.0f * 16.0f; // g
+                    float accel_y = (float)ay / 32768.0f * 16.0f; // g
+                    float accel_z = (float)az / 32768.0f * 16.0f; // g
+
+                    // Gyro (degrees/second @ 2000 dps full-scale)
+                    int16_t gx = get_signed_int16(data[9] << 8 | data[8]);
+                    int16_t gy = get_signed_int16(data[11] << 8 | data[10]);
+                    int16_t gz = get_signed_int16(data[13] << 8 | data[12]);
+                    float gyro_x = (float)gx / 32768.0f * 2000.0f;
+                    float gyro_y = (float)gy / 32768.0f * 2000.0f;
+                    float gyro_z = (float)gz / 32768.0f * 2000.0f;
+
+                    // Angles (degrees)
+                    int16_t ang_x = get_signed_int16(data[15] << 8 | data[14]);
+                    int16_t ang_y = get_signed_int16(data[17] << 8 | data[16]);
+                    int16_t ang_z = get_signed_int16(data[19] << 8 | data[18]);
+                    float angle_x = (float)ang_x / 32768.0f * 180.0f;
+                    float angle_y = (float)ang_y / 32768.0f * 180.0f;
+                    float angle_z = (float)ang_z / 32768.0f * 180.0f;
+
+                    if (ble_data->data_callback) {
+                        unsigned char callback_data[37];
+                        callback_data[0] = 0x61;
+                        float *data_ptr = (float*)(callback_data + 1);
+                        data_ptr[0] = accel_x; data_ptr[1] = accel_y; data_ptr[2] = accel_z;
+                        data_ptr[3] = gyro_x;  data_ptr[4] = gyro_y;  data_ptr[5] = gyro_z;
+                        data_ptr[6] = angle_x; data_ptr[7] = angle_y; data_ptr[8] = angle_z;
+                        ble_data->data_callback(ble_data->pd_obj, callback_data, 37);
+                    }
+                    break;
                 }
+
+                case 0x71: { // Quaternion only
+                    if (length < 12) break;
+                    // Many firmwares send quaternion directly under 0x71 frame; interpret as q0..q3 next words
+                    int16_t q0 = get_signed_int16(data[5] << 8 | data[4]);
+                    int16_t q1 = get_signed_int16(data[7] << 8 | data[6]);
+                    int16_t q2 = get_signed_int16(data[9] << 8 | data[8]);
+                    int16_t q3 = get_signed_int16(data[11] << 8 | data[10]);
+                    float quat_w = (float)q0 / 32768.0f;
+                    float quat_x = (float)q1 / 32768.0f;
+                    float quat_y = (float)q2 / 32768.0f;
+                    float quat_z = (float)q3 / 32768.0f;
+
+                    if (ble_data->data_callback) {
+                        unsigned char callback_data[17];
+                        callback_data[0] = 0x71;
+                        float *data_ptr = (float*)(callback_data + 1);
+                        data_ptr[0] = quat_w; data_ptr[1] = quat_x; data_ptr[2] = quat_y; data_ptr[3] = quat_z;
+                        ble_data->data_callback(ble_data->pd_obj, callback_data, 17);
+                    }
+                    break;
+                }
+
+                default:
+                    // Ignore other packet types for now
+                    break;
             }
         }
     

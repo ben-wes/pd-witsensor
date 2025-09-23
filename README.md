@@ -14,7 +14,7 @@ Pure Data external for WIT BWT901 BLE sensors. macOS build uses SimpleBLE (stati
 
 ```bash
 # Recommended: clone with submodules
-git clone --recurse-submodules https://github.com/<your-org>/pd-witsensor.git
+git clone --recurse-submodules https://github.com/ben-wes/pd-witsensor.git
 cd pd-witsensor
 
 # If you already cloned without submodules
