@@ -66,7 +66,11 @@ jobs:
         run: |
           ARCH=${{ matrix.arch == 'amd64' && 'x86_64' || matrix.arch }}
           make deps
-          make install PDLIBDIR=${{ env.PDLIBDIR }} floatsize=${{ matrix.floatsize }} extension=d_${{ matrix.arch }} arch=${ARCH}
+          if [ ${{ matrix.floatsize }} -eq 32 ]; then
+            make install PDLIBDIR=${{ env.PDLIBDIR }} floatsize=${{ matrix.floatsize }} extension=d_${{ matrix.arch }} arch=${ARCH}
+          else
+            make install PDLIBDIR=${{ env.PDLIBDIR }} floatsize=${{ matrix.floatsize }} extension=darwin-${{ matrix.arch }}-${{ matrix.floatsize }}.so arch=${ARCH}
+          fi
 
       - name: Archive artifacts
         uses: actions/upload-artifact@v4
