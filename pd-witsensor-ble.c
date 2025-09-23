@@ -2,9 +2,8 @@
  * PureData external for WIT BWT901BLE5.0 sensor with BLE support
  * based on simpleBLE library
  * 
- * Copyright (c) 2025 pd-witsensor contributors
- * Licensed under Business Source License 1.1 (BUSL-1.1)
- * See LICENSE for details
+ * This is free and unencumbered software released into the public domain.
+ * For more information, please refer to <https://unlicense.org>
  */
 
 #include <stdio.h>

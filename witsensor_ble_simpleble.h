@@ -2,9 +2,8 @@
  * Cross-platform BLE implementation using SimpleBLE
  * Supports macOS, Windows, and Linux
  * 
- * Copyright (c) 2025 pd-witsensor contributors
- * Licensed under Business Source License 1.1 (BUSL-1.1)
- * See LICENSE for details
+ * This is free and unencumbered software released into the public domain.
+ * For more information, please refer to <https://unlicense.org>
  */
 
 #ifndef WITSENSOR_BLE_SIMPLEBLE_H

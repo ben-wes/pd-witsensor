@@ -47,6 +47,6 @@ Note: On macOS we link SimpleBLE statically; on Linux we use the shared build tr
 
 ### License
 
-- **This project**: Business Source License 1.1 (BUSL‑1.1). Non‑commercial use permitted; commercial use requires a license. Each version converts to GPL‑3 after four years. See `LICENSE`.
+- **This project**: Unlicense (public domain). Free for any use. See `LICENSE`.
 - **SimpleBLE**: Business Source License 1.1 (BUSL‑1.1). Non‑commercial use permitted; commercial use requires a SimpleBLE commercial license. Each version converts to GPL‑3 after four years. See `SimpleBLE/LICENSE.md`.
 - **WIT sensors**: This project uses the sensor's communication protocol (not proprietary SDK code).
