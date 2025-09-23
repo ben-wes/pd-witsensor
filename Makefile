@@ -66,10 +66,10 @@ deps: $(SIMPLEBLE_STATIC_LIBS) $(SIMPLEBLE_SHARED_LIBS)
 
 $(SIMPLEBLE_STATIC_LIBS):
 	git submodule update --init --recursive
-	cd $(SIMPLEBLE_DIR) && cmake -S .. -B build-static -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+	cd $(SIMPLEBLE_DIR) && cmake -S . -B build-static -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
 	$(MAKE) -C $(SIMPLEBLE_STATIC_DIR) -j$(shell sysctl -n hw.ncpu 2>/dev/null || nproc)
 
 $(SIMPLEBLE_SHARED_LIBS):
 	git submodule update --init --recursive
-	cd $(SIMPLEBLE_DIR) && cmake -S .. -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON
+	cd $(SIMPLEBLE_DIR) && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON
 	$(MAKE) -C $(SIMPLEBLE_SHARED_DIR) -j$(shell sysctl -n hw.ncpu 2>/dev/null || nproc)
