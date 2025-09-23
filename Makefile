@@ -21,11 +21,8 @@ ldlibs = -lpthread
 define forDarwin
 	# Link against static libs built by SimpleBLE (no runtime dylib needed)
 	ldlibs += -L./SimpleBLE/simplecble/build-static/lib -Wl,-force_load,./SimpleBLE/simplecble/build-static/lib/libsimplecble.a -Wl,-force_load,./SimpleBLE/simplecble/build-static/lib/libsimpleble.a -framework CoreBluetooth -framework Foundation
-	# Include Objective-C helper only for static builds (not shared libraries)
-	# Check if extension starts with 'd_' (static builds) vs '.so' (shared builds)
-	ifneq ($(filter d_%,$(extension)),)
-		witsensor.class.sources += macos_bt_auth.m
-	endif
+	# Include Objective-C helper for all macOS builds (needed for Bluetooth permissions)
+	witsensor.class.sources += macos_bt_auth.m
 endef
 
 
@@ -54,6 +51,13 @@ macos_bt_auth.d_amd64.o: macos_bt_auth.m
 
 macos_bt_auth.d_arm64.o: macos_bt_auth.m
 	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -arch arm64 -mmacosx-version-min=10.6 -c macos_bt_auth.m -o macos_bt_auth.d_arm64.o
+
+# Build rules for shared library extensions
+macos_bt_auth.darwin-amd64-64.so.o: macos_bt_auth.m
+	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -arch x86_64 -mmacosx-version-min=10.6 -c macos_bt_auth.m -o macos_bt_auth.darwin-amd64-64.so.o
+
+macos_bt_auth.darwin-arm64-64.so.o: macos_bt_auth.m
+	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -arch arm64 -mmacosx-version-min=10.6 -c macos_bt_auth.m -o macos_bt_auth.darwin-arm64-64.so.o
 
 # SimpleBLE dependencies (build static for macOS and shared for Linux)
 SIMPLEBLE_DIR=SimpleBLE/simplecble
