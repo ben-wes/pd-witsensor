@@ -21,8 +21,11 @@ ldlibs = -lpthread
 define forDarwin
 	# Link against static libs built by SimpleBLE (no runtime dylib needed)
 	ldlibs += -L./SimpleBLE/simplecble/build-static/lib -Wl,-force_load,./SimpleBLE/simplecble/build-static/lib/libsimplecble.a -Wl,-force_load,./SimpleBLE/simplecble/build-static/lib/libsimpleble.a -framework CoreBluetooth -framework Foundation
-	# Include Objective-C helper only on macOS
-	witsensor.class.sources += macos_bt_auth.m
+	# Include Objective-C helper only for static builds (not shared libraries)
+	# Check if extension starts with 'd_' (static builds) vs '.so' (shared builds)
+	ifneq ($(filter d_%,$(extension)),)
+		witsensor.class.sources += macos_bt_auth.m
+	endif
 endef
 
 
