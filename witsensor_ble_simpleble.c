@@ -175,7 +175,9 @@ static void witsensor_ble_simpleble_scan_delayed(witsensor_ble_simpleble_t *ble_
     ble_data->is_scanning = 1;
     simpleble_adapter_scan_for(ble_data->adapter, 4000);
     ble_data->is_scanning = 0;
+#ifdef __APPLE__
     _enumerate_results_mac(ble_data);
+#endif
 }
 
 // Helpers to manage cached scan results (CoreBluetooth thread safe: no Pd calls)
