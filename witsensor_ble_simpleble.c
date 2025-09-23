@@ -55,9 +55,6 @@ static simpleble_uuid_t WIT_WRITE_CHARACTERISTIC_UUID = {.value = WIT_WRITE_CHAR
 
 // Forward declare helpers used by macOS scan tasks
 static void _clear_cached_results(witsensor_ble_simpleble_t *ble);
-#ifdef __APPLE__
-static void _enumerate_results_mac(witsensor_ble_simpleble_t *ble);
-#endif
 
 // Helper function to output scan results via status outlet
 static void _output_scan_results(witsensor_ble_simpleble_t *ble_data) {
@@ -129,35 +126,6 @@ static void _scan_stop_task(void *v) {
 }
 #endif
 
-#ifdef __APPLE__
-static void _enumerate_results_mac(witsensor_ble_simpleble_t *ble) {
-    if (!ble || !ble->adapter) return;
-    size_t results_count = simpleble_adapter_scan_get_results_count(ble->adapter);
-    // Refresh cache
-    for (unsigned long i = 0; i < ble->cached_count; i++) {
-        if (ble->cached_ids) free(ble->cached_ids[i]);
-        if (ble->cached_addrs) free(ble->cached_addrs[i]);
-    }
-    free(ble->cached_ids); ble->cached_ids = NULL;
-    free(ble->cached_addrs); ble->cached_addrs = NULL;
-    ble->cached_count = (unsigned long)results_count;
-    if (results_count == 0) { return; }
-    ble->cached_ids = (char**)calloc(results_count, sizeof(char*));
-    ble->cached_addrs = (char**)calloc(results_count, sizeof(char*));
-    for (size_t i = 0; i < results_count; i++) {
-        simpleble_peripheral_t peripheral = simpleble_adapter_scan_get_results_handle(ble->adapter, i);
-        if (!peripheral) continue;
-        char *peripheral_address = simpleble_peripheral_address(peripheral);
-        char *peripheral_identifier = simpleble_peripheral_identifier(peripheral);
-        if (peripheral_identifier && peripheral_address) {
-            ble->cached_ids[i] = strdup(peripheral_identifier);
-            ble->cached_addrs[i] = strdup(peripheral_address);
-        }
-        if (peripheral_address) simpleble_free(peripheral_address);
-        if (peripheral_identifier) simpleble_free(peripheral_identifier);
-    }
-}
-#endif
 
 
 // Helpers to manage cached scan results (CoreBluetooth thread safe: no Pd calls)
