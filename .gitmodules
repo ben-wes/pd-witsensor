@@ -1,0 +1,6 @@
+[submodule "pd-lib-builder"]
+	path = pd-lib-builder
+	url = https://github.com/pure-data/pd-lib-builder.git
+[submodule "SimpleBLE"]
+    path = SimpleBLE
+    url = https://github.com/simpleble/simpleble.git

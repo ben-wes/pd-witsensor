@@ -1,0 +1,33 @@
+# Build artifacts
+*.pd_darwin.o
+*.pd_darwin
+*.dSYM/
+*.dylib
+*.so
+
+# System files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporary files
+*~
+*.tmp
+*.temp
+
+# Ignore WIT Android sample programs and SDK artifacts
+Android sample program/
+
+# Ignore WIT Python SDK folder
+BWT901BLE5.0_python_sdk/
+legacy/BWT901BLE5.0_python_sdk.zip
