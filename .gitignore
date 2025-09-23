@@ -4,6 +4,8 @@
 *.dSYM/
 *.dylib
 *.so
+*.ino
+*.pdf
 
 # System files
 .DS_Store
@@ -30,4 +32,6 @@ Android sample program/
 
 # Ignore WIT Python SDK folder
 BWT901BLE5.0_python_sdk/
-legacy/BWT901BLE5.0_python_sdk.zip
+legacy/
+
+build.sh
