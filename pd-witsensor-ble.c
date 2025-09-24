@@ -63,6 +63,7 @@ typedef struct _witsensor {
     // Clock for polling
     t_clock *poll_clock;
     t_float poll_interval;
+    t_symbol *poll_type;  // "quat", "mag", "battery", "temp", etc.
     
     // BLE specific
     witsensor_ble_simpleble_t *ble_data;
@@ -75,17 +76,31 @@ typedef struct _witsensor {
 t_class *witsensor_class;
 
 // Forward declarations
-static void witsensor_scan_devices(t_witsensor *x, t_float timeout_sec);
+static void witsensor_scan_devices(t_witsensor *x);
 static void witsensor_get_scan_results(t_witsensor *x);
 static void witsensor_connect_device(t_witsensor *x, t_symbol *device_name);
 static void witsensor_disconnect(t_witsensor *x);
-static void witsensor_process_data(t_witsensor *x, unsigned char *data, int length);
+static void witsensor_process_register_response(t_witsensor *x, unsigned char *data, int length);
+static void witsensor_process_streaming_data_immediate(t_witsensor *x, unsigned char *data, int length);
 static void witsensor_send_sensor_data(t_witsensor *x);
 static void witsensor_send_quaternion_data(t_witsensor *x);
 static void witsensor_poll_tick(t_witsensor *x);
+static void witsensor_battery(t_witsensor *x);
+static void witsensor_temp(t_witsensor *x);
+static void witsensor_mag(t_witsensor *x);
+static void witsensor_quat(t_witsensor *x);
+static void witsensor_save(t_witsensor *x);
+static void witsensor_restore(t_witsensor *x);
 // pd_queue_mess marshaling
 typedef struct _queued_pkt { int length; unsigned char bytes[64]; } t_queued_pkt;
+typedef struct _queued_output { 
+    t_symbol *msg; 
+    int argc; 
+    t_atom argv[4]; 
+} t_queued_output;
+
 static void witsensor_pd_queued_handler(t_pd *obj, void *data);
+static void witsensor_pd_output_handler(t_pd *obj, void *data);
 static void witsensor_ble_data_callback(void *user_data, unsigned char *data, int length);
 void witsensor_pd_scan_complete_handler(t_pd *obj, void *data);
 // New Pd-thread handlers for status output
@@ -99,11 +114,128 @@ static void witsensor_ble_data_callback(void *user_data, unsigned char *data, in
     t_witsensor *x = (t_witsensor *)user_data;
     if (!x) return;
     if (length <= 0 || length > 64) return;
+    
+    // Check if this is a register read response that should be processed immediately
+    if (data[0] == 0x55 && data[1] == 0x71 && length >= 6) {
+        unsigned char start = data[2];
+        // Process register read responses immediately to avoid queue flooding
+        if (start == 0x64 || start == 0x40 || start == 0x3A || start == 0x51) {
+            // Process immediately on BLE thread (safe for register reads)
+            witsensor_process_register_response(x, data, length);
+            return;
+        }
+    }
+    
+    // Process streaming data (0x61) - parse on BLE thread, queue for Pd thread
+    if (data[0] == 0x55 && data[1] == 0x61 && length >= 20) {
+        witsensor_process_streaming_data_immediate(x, data, length);
+        // Queue the output for immediate Pd thread processing
+        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
+        if (out) {
+            out->msg = gensym("streaming");
+            out->argc = 0;
+            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+        }
+        return;
+    }
+    
+    // Queue other data types for Pd thread processing
     t_queued_pkt *pkt = (t_queued_pkt *)malloc(sizeof(t_queued_pkt));
     if (!pkt) return;
     pkt->length = length;
     memcpy(pkt->bytes, data, length);
     pd_queue_mess(x->pd_instance, (t_pd *)x, pkt, witsensor_pd_queued_handler);
+}
+
+// Process register read responses immediately on BLE thread (thread-safe for register reads)
+static void witsensor_process_register_response(t_witsensor *x, unsigned char *data, int length) {
+    if (!x || !data || length < 6) return;
+    
+    unsigned char start = data[2];
+    if (start == 0x64) {
+        // Battery centivolts in first word (little-endian)
+        uint16_t vraw = (uint16_t)(data[4] | (data[5] << 8));
+        float volts = (float)vraw / 100.0f;
+        int pct = 0;
+        if (vraw > 396) pct = 100;
+        else if (vraw >= 393) pct = 90;
+        else if (vraw >= 387) pct = 75;
+        else if (vraw >= 382) pct = 60;
+        else if (vraw >= 379) pct = 50;
+        else if (vraw >= 377) pct = 40;
+        else if (vraw >= 373) pct = 30;
+        else if (vraw >= 370) pct = 20;
+        else if (vraw >= 368) pct = 15;
+        else if (vraw >= 350) pct = 10;
+        else if (vraw >= 340) pct = 5;
+        else pct = 0;
+        
+        // Queue the output for Pd thread (thread-safe)
+        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
+        if (out) {
+            out->msg = gensym("battery");
+            out->argc = 2;
+            SETFLOAT(&out->argv[0], volts);
+            SETFLOAT(&out->argv[1], (t_float)pct);
+            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+        }
+        return;
+    }
+    if (start == 0x40 && length >= 6) {
+        // Temperature: assume first word is in centi-degC
+        uint16_t traw = (uint16_t)(data[4] | (data[5] << 8));
+        float degC = (float)((int16_t)traw) / 100.0f;
+        
+        // Queue the output for Pd thread (thread-safe)
+        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
+        if (out) {
+            out->msg = gensym("temp");
+            out->argc = 1;
+            SETFLOAT(&out->argv[0], (t_float)degC);
+            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+        }
+        return;
+    }
+    if (start == 0x3A && length >= 10) {
+        // Magnetic field: three words; convert to uT via /150
+        int16_t mx = (int16_t)((data[5] << 8) | data[4]);
+        int16_t my = (int16_t)((data[7] << 8) | data[6]);
+        int16_t mz = (int16_t)((data[9] << 8) | data[8]);
+        
+        // Queue the output for Pd thread (thread-safe)
+        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
+        if (out) {
+            out->msg = gensym("mag");
+            out->argc = 3;
+            SETFLOAT(&out->argv[0], (t_float)((float)mx / 150.0f));
+            SETFLOAT(&out->argv[1], (t_float)((float)my / 150.0f));
+            SETFLOAT(&out->argv[2], (t_float)((float)mz / 150.0f));
+            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+        }
+        return;
+    }
+    if (start == 0x51 && length >= 12) {
+        // Quaternion from register page starting at 0x51: four int16 words
+        int16_t q0 = (int16_t)((data[5] << 8) | data[4]);
+        int16_t q1 = (int16_t)((data[7] << 8) | data[6]);
+        int16_t q2 = (int16_t)((data[9] << 8) | data[8]);
+        int16_t q3 = (int16_t)((data[11] << 8) | data[10]);
+        
+        // Store in object (thread-safe for simple assignments)
+        x->quat_w = (float)q0 / 32768.0f;
+        x->quat_x = (float)q1 / 32768.0f;
+        x->quat_y = (float)q2 / 32768.0f;
+        x->quat_z = (float)q3 / 32768.0f;
+        
+        // Queue the output for Pd thread (thread-safe)
+        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
+        if (out) {
+            out->msg = gensym("quat");
+            out->argc = 0;
+            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+        }
+        return;
+    }
 }
 
 // Pd-thread handler to print cached scan results
@@ -163,49 +295,34 @@ void witsensor_pd_device_found_handler(t_pd *obj, void *data) {
 }
 
 
-// Process incoming sensor data
-static void witsensor_process_data(t_witsensor *x, unsigned char *data, int length) {
-    if (!x || !data || length < 1) {
-        post("witsensor: ERROR - Invalid data processing parameters");
-        return;
-    }
+// Process streaming data directly on BLE thread (SAFE - no Pd calls)
+static void witsensor_process_streaming_data_immediate(t_witsensor *x, unsigned char *data, int length) {
+    if (!x || !data || length < 20) return;
     
-    unsigned char packet_type = data[0];
-    
-    if (packet_type == 0x61 && length >= 37) {
-        
-        // Accelerometer, Gyroscope, and Angle data (9 floats + 1 byte type)
-        float *values = (float*)(data + 1);
-        
-        // Update sensor data with bounds checking
-        x->accel_x = values[0];
-        x->accel_y = values[1];
-        x->accel_z = values[2];
-        x->gyro_x = values[3];
-        x->gyro_y = values[4];
-        x->gyro_z = values[5];
-        x->angle_x = values[6];
-        x->angle_y = values[7];
-        x->angle_z = values[8];
+    // Parse accel+gyro+angles: 55 61 ... words packed int16
+    int16_t ax = (int16_t)((data[3] << 8) | data[2]);
+    int16_t ay = (int16_t)((data[5] << 8) | data[4]);
+    int16_t az = (int16_t)((data[7] << 8) | data[6]);
+    x->accel_x = (float)ax / 32768.0f * 16.0f;
+    x->accel_y = (float)ay / 32768.0f * 16.0f;
+    x->accel_z = (float)az / 32768.0f * 16.0f;
 
-        // Output to Pure Data outlets
-        witsensor_send_sensor_data(x);
-        
-    } else if (packet_type == 0x71) {
-        // Quaternion data (4 floats)
-        if (length >= 17) {
-            float *values = (float*)(data + 1);
-            // Sanity check floats are finite
-            if (values[0] == values[0] && values[1] == values[1]) {
-                x->quat_w = values[0];
-                x->quat_x = values[1];
-                x->quat_y = values[2];
-                x->quat_z = values[3];
-                witsensor_send_quaternion_data(x);
-                return;
-            }
-        }
-    }
+    int16_t gx = (int16_t)((data[9] << 8) | data[8]);
+    int16_t gy = (int16_t)((data[11] << 8) | data[10]);
+    int16_t gz = (int16_t)((data[13] << 8) | data[12]);
+    x->gyro_x = (float)gx / 32768.0f * 2000.0f;
+    x->gyro_y = (float)gy / 32768.0f * 2000.0f;
+    x->gyro_z = (float)gz / 32768.0f * 2000.0f;
+
+    int16_t rx = (int16_t)((data[15] << 8) | data[14]);
+    int16_t ry = (int16_t)((data[17] << 8) | data[16]);
+    int16_t rz = (int16_t)((data[19] << 8) | data[18]);
+    x->angle_x = (float)rx / 32768.0f * 180.0f;
+    x->angle_y = (float)ry / 32768.0f * 180.0f;
+    x->angle_z = (float)rz / 32768.0f * 180.0f;
+
+    // Data is now updated in object state - outlet calls will happen on Pd thread
+    // This is SAFE - we only update the object's internal state
 }
 
 // Send quaternion data as PureData messages
@@ -243,6 +360,9 @@ static void witsensor_send_sensor_data(t_witsensor *x) {
     outlet_anything(x->data_out, gensym("angle"), 3, args);
 }
 
+// Streaming data monitoring removed - using push mechanism instead
+
+// Function for polling requests (battery/temp/mag/quat)
 static void witsensor_poll_tick(t_witsensor *x) {
     if (!x || !x->ble_data) {
         post("witsensor: ERROR - Invalid object or BLE data");
@@ -254,39 +374,75 @@ static void witsensor_poll_tick(t_witsensor *x) {
     x->is_scanning = witsensor_ble_simpleble_is_scanning(x->ble_data);
 
     // Only poll if connected and interval is set
-    if (x->poll_interval > 0 && x->is_connected) {
-        // Request quaternion data only (per manual: FF AA 27 51 00)
-        unsigned char cmd_quat[] = {0xFF, 0xAA, 0x27, 0x51, 0x00};
-        (void)witsensor_ble_simpleble_write_data(x->ble_data, cmd_quat, sizeof(cmd_quat));
+    if (x->poll_interval > 0 && x->is_connected && x->poll_type) {
+        // Call the appropriate single-shot function based on poll_type
+        if (x->poll_type == gensym("quat")) {
+            witsensor_quat(x);
+        } else if (x->poll_type == gensym("mag")) {
+            witsensor_mag(x);
+        } else if (x->poll_type == gensym("battery")) {
+            witsensor_battery(x);
+        } else if (x->poll_type == gensym("temp")) {
+            witsensor_temp(x);
+        }
         
         // Schedule next poll
         clock_delay(x->poll_clock, x->poll_interval);
     } else if (x->poll_interval > 0 && !x->is_connected) {
         // Stop polling when disconnected
-        post("witsensor: disconnected, stopping quaternion polling");
+        post("witsensor: disconnected, stopping %s polling", x->poll_type ? x->poll_type->s_name : "unknown");
         x->poll_interval = 0;
+        x->poll_type = NULL;
     }
+    // Note: No else clause - polling clock stops when not needed
 }
 
 // Drain queued packets on Pd scheduler thread
 // pd_queue_mess handler
 static void witsensor_pd_queued_handler(t_pd *obj, void *data) {
     if (!obj || !data) return;
-    t_witsensor *x = (t_witsensor *)obj;
     t_queued_pkt *pkt = (t_queued_pkt *)data;
-    witsensor_process_data(x, pkt->bytes, pkt->length);
+    
+    // Process any remaining data types that aren't handled immediately
+    // Note: Register responses (0x71) and streaming data (0x61) are now processed immediately
+    if (pkt->length >= 2) {
+        post("witsensor: unexpected data type: 0x%02X 0x%02X (length=%d)", 
+             pkt->bytes[0], pkt->bytes[1], pkt->length);
+    }
+    
     free(pkt);
 }
 
-// Scan for WIT devices
-static void witsensor_scan_devices(t_witsensor *x, t_float timeout_sec) {
+// Handle queued output messages on Pd scheduler thread
+static void witsensor_pd_output_handler(t_pd *obj, void *data) {
+    if (!obj || !data) return;
+    t_witsensor *x = (t_witsensor *)obj;
+    t_queued_output *out = (t_queued_output *)data;
+    
+    if (out->msg == gensym("battery")) {
+        outlet_anything(x->status_out, out->msg, out->argc, out->argv);
+    } else if (out->msg == gensym("temp")) {
+        outlet_anything(x->status_out, out->msg, out->argc, out->argv);
+    } else if (out->msg == gensym("mag")) {
+        outlet_anything(x->data_out, out->msg, out->argc, out->argv);
+    } else if (out->msg == gensym("quat")) {
+        witsensor_send_quaternion_data(x);
+    } else if (out->msg == gensym("streaming")) {
+        witsensor_send_sensor_data(x);
+    }
+    
+    free(out);
+}
+
+// Scan for WIT devices (continuous until stopped or connected)
+static void witsensor_scan_devices(t_witsensor *x) {
     post("witsensor: scanning for BLE devices...");
     if (!x->ble_data) { post("witsensor: BLE not initialized"); return; }
-    if (timeout_sec > 0) {
-        int ms = (int)(timeout_sec * 1000.0f);
-        if (ms < 100) ms = 100;
-        x->ble_data->scan_timeout_ms = ms;
-    }
+    
+    // Reset scan results list
+    witsensor_ble_simpleble_clear_scan_results(x->ble_data);
+    
+    // Continuous scanning (no timeout needed)
     witsensor_ble_simpleble_start_scanning(x->ble_data);
 }
 
@@ -329,8 +485,6 @@ static void witsensor_connect_device(t_witsensor *x, t_symbol *device_identifier
             usleep(30000);
             unsigned char cmd_bw[] = {0xFF, 0xAA, 0x1F, 0x03, 0x00}; // bandwidth 42 Hz
             witsensor_ble_simpleble_write_data(x->ble_data, cmd_bw, sizeof(cmd_bw));
-            unsigned char cmd_save[] = {0xFF, 0xAA, 0x00, 0x00, 0x00};
-            witsensor_ble_simpleble_write_data(x->ble_data, cmd_save, sizeof(cmd_save));
             // Do not start quaternion polling by default
             x->poll_interval = 0;
         } else {
@@ -339,20 +493,6 @@ static void witsensor_connect_device(t_witsensor *x, t_symbol *device_identifier
         return;
     } else {
         post("witsensor: BLE not initialized");
-    }
-}
-
-// Connect to device by address
-static void witsensor_connect_by_address(t_witsensor *x, t_symbol *device_address) {
-    if (device_address && device_address->s_name) {
-        strcpy(x->device_address, device_address->s_name);
-        post("witsensor: connecting to device by address: %s", x->device_address);
-        
-        if (x->ble_data) {
-            witsensor_ble_simpleble_connect_by_address(x->ble_data, x->device_address);
-        } else {
-            post("witsensor: BLE not initialized");
-        }
     }
 }
 
@@ -401,10 +541,6 @@ static void witsensor_set_rate(t_witsensor *x, t_float rate) {
         unsigned char cmd_rate[] = {0xFF, 0xAA, 0x03, rate_code, 0x00};
         witsensor_ble_simpleble_write_data(x->ble_data, cmd_rate, sizeof(cmd_rate));
         
-        // Save configuration
-        unsigned char cmd_save[] = {0xFF, 0xAA, 0x00, 0x00, 0x00}; // Save command
-        witsensor_ble_simpleble_write_data(x->ble_data, cmd_save, sizeof(cmd_save));
-        
         t_atom args[2];
         SETFLOAT(&args[0], rate);
         SETFLOAT(&args[1], rate_code);
@@ -432,33 +568,140 @@ static void witsensor_set_bandwidth(t_witsensor *x, t_float hz) {
     unsigned char cmd_bw[] = {0xFF, 0xAA, 0x1F, bw_code, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_bw, sizeof(cmd_bw));
     
-    
-    unsigned char cmd_save[] = {0xFF, 0xAA, 0x00, 0x00, 0x00};
-    witsensor_ble_simpleble_write_data(x->ble_data, cmd_save, sizeof(cmd_save));
     t_atom a; SETFLOAT(&a, hz);
     outlet_anything(x->status_out, gensym("bandwidth"), 1, &a);
 }
 
-// Set polling interval (in milliseconds) - for backward compatibility
-static void witsensor_set_pollquat(t_witsensor *x, t_float interval) {
-    // Interpret argument as desired quaternion polling Hz (0 to disable)
-    if (interval <= 0) {
-        x->poll_interval = 0;
-        clock_unset(x->poll_clock);
-        outlet_anything(x->status_out, gensym("pollquat"), 0, NULL);
+// Battery request: FF AA 27 64 00
+static void witsensor_battery(t_witsensor *x) {
+    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    
+    // Note: Battery requests may be unreliable with active streaming
+    // Users should pause streaming (rate 0) before requesting battery data
+    unsigned char cmd[] = {0xFF, 0xAA, 0x27, 0x64, 0x00};
+    witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
+}
+
+// Request temperature data: FF AA 27 40 00
+static void witsensor_temp(t_witsensor *x) {
+    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    
+    // Note: Temperature requests may be unreliable with active streaming
+    // Users should pause streaming (rate 0) before requesting temperature data
+    unsigned char cmd[] = {0xFF, 0xAA, 0x27, 0x40, 0x00};
+    witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
+}
+
+// Request magnetic field data: FF AA 27 3A 00
+static void witsensor_mag(t_witsensor *x) {
+    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    
+    // Note: Magnetic field requests may be unreliable with active streaming
+    // Users should pause streaming (rate 0) before requesting magnetic field data
+    unsigned char cmd[] = {0xFF, 0xAA, 0x27, 0x3A, 0x00};
+    witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
+}
+
+// Request quaternion data: FF AA 27 51 00
+static void witsensor_quat(t_witsensor *x) {
+    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    
+    // Note: Quaternion requests may be unreliable with active streaming
+    // Users should pause streaming (rate 0) before requesting quaternion data
+    unsigned char cmd[] = {0xFF, 0xAA, 0x27, 0x51, 0x00};
+    witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
+}
+
+// Set angle reference (zero): FF AA 01 08 00
+static void witsensor_xyzero(t_witsensor *x) {
+    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    unsigned char cmd[] = {0xFF, 0xAA, 0x01, 0x08, 0x00};
+    witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
+}
+
+
+// Set installation orientation: FF AA 23 <0|1> 00
+static void witsensor_set_orientation(t_witsensor *x, t_float f) {
+    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    int orient = (int)f; if (orient < 0) orient = 0; if (orient > 1) orient = 1;
+    unsigned char cmd[] = {0xFF, 0xAA, 0x23, (unsigned char)orient, 0x00};
+    witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
+}
+
+// Set output content (AGPVS): FF AA 96 <0..3> 00
+static void witsensor_set_output_mode(t_witsensor *x, t_float f) {
+    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    int mode = (int)f; if (mode < 0) mode = 0; if (mode > 3) mode = 3;
+    unsigned char cmd[] = {0xFF, 0xAA, 0x96, (unsigned char)mode, 0x00};
+    witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
+}
+
+// Set baud rate: FF AA 04 <0..255> 00
+static void witsensor_set_baud(t_witsensor *x, t_float f) {
+    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    int baud = (int)f; if (baud < 0) baud = 0; if (baud > 255) baud = 255;
+    post("witsensor: setting baud rate to %d", baud);
+    unsigned char cmd[] = {0xFF, 0xAA, 0x04, (unsigned char)baud, 0x00};
+    witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
+}
+
+// Save configuration: FF AA 00 00 00
+static void witsensor_save(t_witsensor *x) {
+    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    post("witsensor: saving configuration");
+    unsigned char cmd[] = {0xFF, 0xAA, 0x00, 0x00, 0x00};
+    witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
+}
+
+// Restore configuration: FF AA 00 01 00
+static void witsensor_restore(t_witsensor *x) {
+    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    post("witsensor: restoring configuration");
+    unsigned char cmd[] = {0xFF, 0xAA, 0x00, 0x01, 0x00};
+    witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
+}
+
+// Unified polling method: poll <type> <interval>
+// Examples: poll quat 10, poll mag 5, poll battery 1, poll temp 2
+static void witsensor_poll(t_witsensor *x, t_symbol *type, t_float interval) {
+    if (!type) {
+        post("witsensor: poll requires a type (quat, mag, battery, temp)");
         return;
     }
-    if (interval > 50.0f) interval = 50.0f; // cap at 50 Hz to avoid BLE congestion
+    
+    // Validate type
+    if (type != gensym("quat") && type != gensym("mag") && 
+        type != gensym("battery") && type != gensym("temp")) {
+        post("witsensor: poll type must be one of: quat, mag, battery, temp");
+        return;
+    }
+    
+    // Stop current polling if interval is 0 or negative
+    if (interval <= 0) {
+        x->poll_interval = 0;
+        x->poll_type = NULL;
+        // Stop the polling clock - streaming data has its own separate clock
+        clock_unset(x->poll_clock);
+        outlet_anything(x->status_out, gensym("poll"), 0, NULL);
+        return;
+    }
+    
+    // Cap at 50 Hz to avoid BLE congestion
+    if (interval > 50.0f) interval = 50.0f;
     int period_ms = (int)(1000.0f / interval);
     if (period_ms < 1) period_ms = 1;
+    
     x->poll_interval = period_ms;
+    x->poll_type = type;
+    
     if (x->is_connected) {
         clock_unset(x->poll_clock);
         clock_delay(x->poll_clock, x->poll_interval);
-        t_atom args[2];
-        SETFLOAT(&args[0], 1000.0f / x->poll_interval);
-        SETFLOAT(&args[1], x->poll_interval);
-        outlet_anything(x->status_out, gensym("pollquat"), 2, args);
+        t_atom args[3];
+        SETSYMBOL(&args[0], type);
+        SETFLOAT(&args[1], 1000.0f / x->poll_interval);
+        SETFLOAT(&args[2], x->poll_interval);
+        outlet_anything(x->status_out, gensym("poll"), 3, args);
     }
 }
 
@@ -482,6 +725,8 @@ static void *witsensor_new(void) {
     x->is_scanning = 0;
     x->should_stop = 0;
     x->poll_interval = 0;
+    x->poll_type = NULL;
+    // new_streaming_data removed - using push mechanism
     x->temp_bytes_count = 0;
     x->pd_instance = pd_this;
     
@@ -504,6 +749,8 @@ static void *witsensor_new(void) {
     x->angle_x = x->angle_y = x->angle_z = 0.0f;
     x->quat_w = x->quat_x = x->quat_y = x->quat_z = 0.0f;
     
+    // Streaming data monitoring removed - using push mechanism
+    
     return (void *)x;
 }
 
@@ -519,24 +766,17 @@ static void witsensor_free(t_witsensor *x) {
 
 // WIT sensor command functions
 
+// Calibration: calibrate (default=accel), calibrate 1 (mag), calibrate 2 (mag complete)
 static void witsensor_calibrate(t_witsensor *x) {
     if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
-    
-    post("witsensor: starting accelerometer calibration - keep sensor still");
     
     // Unlock
     unsigned char cmd_unlock[] = {0xFF, 0xAA, 0x69, 0x88, 0xB5};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_unlock, sizeof(cmd_unlock));
     usleep(50000);
-    
-    // Accelerometer calibration (keep still)
-    unsigned char cmd_accal[] = {0xFF, 0xAA, 0x01, 0x01, 0x00};
-    witsensor_ble_simpleble_write_data(x->ble_data, cmd_accal, sizeof(cmd_accal));
-    
-    // Save (sensor applies over ~10s)
-    unsigned char cmd_save[] = {0xFF, 0xAA, 0x00, 0x00, 0x00};
-    witsensor_ble_simpleble_write_data(x->ble_data, cmd_save, sizeof(cmd_save));
-    
+    post("witsensor: starting accelerometer calibration - keep sensor still");
+    unsigned char cmd[] = {0xFF, 0xAA, 0x01, 0x01, 0x00};
+    witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
 }
 
 
@@ -553,9 +793,6 @@ static void witsensor_axis(t_witsensor *x, t_float axis_count) {
     unsigned char cmd_algo[] = {0xFF, 0xAA, 0x24, code, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_algo, sizeof(cmd_algo));
     
-    
-    unsigned char cmd_save[] = {0xFF, 0xAA, 0x00, 0x00, 0x00};
-    witsensor_ble_simpleble_write_data(x->ble_data, cmd_save, sizeof(cmd_save));
     t_atom a; SETFLOAT(&a, axis_count);
     outlet_anything(x->status_out, gensym("axis"), 1, &a);
 }
@@ -574,8 +811,6 @@ static void witsensor_magcal_stop(t_witsensor *x) {
     if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
     unsigned char cmd_stop[] = {0xFF, 0xAA, 0x01, 0x00, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_stop, sizeof(cmd_stop));
-    unsigned char cmd_save[] = {0xFF, 0xAA, 0x00, 0x00, 0x00};
-    witsensor_ble_simpleble_write_data(x->ble_data, cmd_save, sizeof(cmd_save));
     outlet_anything(x->status_out, gensym("magcal"), 1, (t_atom[]){(t_atom){.a_type=A_SYMBOL,.a_w.w_symbol=gensym("stop")}});
 }
 
@@ -589,8 +824,6 @@ static void witsensor_zzero(t_witsensor *x) {
     usleep(50000);
     unsigned char cmd_zeroz[] = {0xFF, 0xAA, 0x01, 0x04, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_zeroz, sizeof(cmd_zeroz));
-    unsigned char cmd_save[] = {0xFF, 0xAA, 0x00, 0x00, 0x00};
-    witsensor_ble_simpleble_write_data(x->ble_data, cmd_save, sizeof(cmd_save));
     outlet_anything(x->status_out, gensym("zzero"), 0, NULL);
 }
 
@@ -614,12 +847,11 @@ void witsensor_setup(void) {
                                CLASS_DEFAULT,
                                0);
     
-    class_addmethod(witsensor_class, (t_method)witsensor_scan_devices, gensym("scan"), A_DEFFLOAT, 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_scan_devices, gensym("scan"), 0);
     class_addmethod(witsensor_class, (t_method)witsensor_get_scan_results, gensym("results"), 0);
     class_addmethod(witsensor_class, (t_method)witsensor_connect_device, gensym("connect"), A_SYMBOL, 0);
-    class_addmethod(witsensor_class, (t_method)witsensor_connect_by_address, gensym("connect-addr"), A_SYMBOL, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_disconnect, gensym("disconnect"), 0);
-    class_addmethod(witsensor_class, (t_method)witsensor_set_pollquat, gensym("pollquat"), A_FLOAT, 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_poll, gensym("poll"), A_SYMBOL, A_DEFFLOAT, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_set_rate, gensym("rate"), A_FLOAT, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_set_bandwidth, gensym("bandwidth"), A_FLOAT, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_calibrate, gensym("calibrate"), 0);
@@ -629,6 +861,17 @@ void witsensor_setup(void) {
     // z-axis zero (requires 6-axis setting)
     class_addmethod(witsensor_class, (t_method)witsensor_zzero, gensym("zzero"), 0);
     class_addmethod(witsensor_class, (t_method)witsensor_version, gensym("version"), 0);
+    // New control messages
+    class_addmethod(witsensor_class, (t_method)witsensor_battery, gensym("battery"), 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_temp, gensym("temp"), 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_mag, gensym("mag"), 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_quat, gensym("quat"), 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_xyzero, gensym("xyzero"), 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_set_orientation, gensym("orientation"), A_DEFFLOAT, 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_set_output_mode, gensym("outputmode"), A_DEFFLOAT, 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_set_baud, gensym("baud"), A_DEFFLOAT, 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_save, gensym("save"), 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_restore, gensym("restore"), 0);
     
     witsensor_version();
 }

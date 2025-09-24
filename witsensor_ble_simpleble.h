@@ -45,9 +45,6 @@ typedef struct witsensor_ble_simpleble_t {
     int scan_found_count;
     char adapter_id[128];
     char adapter_addr[64];
-
-    // Scan behavior
-    int scan_timeout_ms;
 } witsensor_ble_simpleble_t;
 
 // Cross-platform BLE interface functions
@@ -56,6 +53,7 @@ void witsensor_ble_simpleble_destroy(witsensor_ble_simpleble_t *ble_data);
 void witsensor_ble_simpleble_start_scanning(witsensor_ble_simpleble_t *ble_data);
 void witsensor_ble_simpleble_stop_scanning(witsensor_ble_simpleble_t *ble_data);
 void witsensor_ble_simpleble_get_scan_results(witsensor_ble_simpleble_t *ble_data);
+void witsensor_ble_simpleble_clear_scan_results(witsensor_ble_simpleble_t *ble_data);
 int witsensor_ble_simpleble_connect(witsensor_ble_simpleble_t *ble_data);
 int witsensor_ble_simpleble_connect_by_address(witsensor_ble_simpleble_t *ble_data, const char *address);
 int witsensor_ble_simpleble_connect_by_identifier(witsensor_ble_simpleble_t *ble_data, const char *identifier);

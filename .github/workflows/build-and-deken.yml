@@ -179,6 +179,11 @@ jobs:
         run: |
           SHORT=${GITHUB_REF:11}
           SLUG=${SHORT//\//_}
+          # Upload platform-specific package
           docker run --rm -e DEKEN_USERNAME -e DEKEN_PASSWORD \
             --volume ./witsensor:/witsensor registry.git.iem.at/pd/deken \
             deken upload --name ${{env.LIBNAME}} --version "${SLUG}" --no-source-error /witsensor
+          # Upload source code
+          docker run --rm -e DEKEN_USERNAME -e DEKEN_PASSWORD \
+            --volume ./witsensor-src:/witsensor registry.git.iem.at/pd/deken \
+            deken upload --name ${{env.LIBNAME}} --version "${SLUG}" /witsensor
