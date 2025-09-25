@@ -65,6 +65,8 @@ typedef struct _witsensor {
     t_float poll_interval;
     t_symbol *poll_type;  // "quat", "mag", "battery", "temp", etc.
     
+    // (No deferred commands needed)
+    
     // BLE specific
     witsensor_ble_simpleble_t *ble_data;
     
@@ -92,14 +94,12 @@ static void witsensor_quat(t_witsensor *x);
 static void witsensor_save(t_witsensor *x);
 static void witsensor_restore(t_witsensor *x);
 // pd_queue_mess marshaling
-typedef struct _queued_pkt { int length; unsigned char bytes[64]; } t_queued_pkt;
 typedef struct _queued_output { 
     t_symbol *msg; 
     int argc; 
     t_atom argv[4]; 
 } t_queued_output;
 
-static void witsensor_pd_queued_handler(t_pd *obj, void *data);
 static void witsensor_pd_output_handler(t_pd *obj, void *data);
 static void witsensor_ble_data_callback(void *user_data, unsigned char *data, int length);
 void witsensor_pd_scan_complete_handler(t_pd *obj, void *data);
@@ -108,6 +108,7 @@ typedef struct _queued_flag { int value; } t_queued_flag;
 typedef struct _queued_device { char *tag; char *addr; char *id; } t_queued_device;
 void witsensor_pd_scanning_handler(t_pd *obj, void *data);
 void witsensor_pd_device_found_handler(t_pd *obj, void *data);
+void witsensor_pd_connected_handler(t_pd *obj, void *data);
 
 // BLE data callback function
 static void witsensor_ble_data_callback(void *user_data, unsigned char *data, int length) {
@@ -138,13 +139,7 @@ static void witsensor_ble_data_callback(void *user_data, unsigned char *data, in
         }
         return;
     }
-    
-    // Queue other data types for Pd thread processing
-    t_queued_pkt *pkt = (t_queued_pkt *)malloc(sizeof(t_queued_pkt));
-    if (!pkt) return;
-    pkt->length = length;
-    memcpy(pkt->bytes, data, length);
-    pd_queue_mess(x->pd_instance, (t_pd *)x, pkt, witsensor_pd_queued_handler);
+    return;
 }
 
 // Process register read responses immediately on BLE thread (thread-safe for register reads)
@@ -373,6 +368,8 @@ static void witsensor_poll_tick(t_witsensor *x) {
     x->is_connected = witsensor_ble_simpleble_is_connected(x->ble_data);
     x->is_scanning = witsensor_ble_simpleble_is_scanning(x->ble_data);
 
+    // No deferred commands
+
     // Only poll if connected and interval is set
     if (x->poll_interval > 0 && x->is_connected && x->poll_type) {
         // Call the appropriate single-shot function based on poll_type
@@ -397,22 +394,6 @@ static void witsensor_poll_tick(t_witsensor *x) {
     // Note: No else clause - polling clock stops when not needed
 }
 
-// Drain queued packets on Pd scheduler thread
-// pd_queue_mess handler
-static void witsensor_pd_queued_handler(t_pd *obj, void *data) {
-    if (!obj || !data) return;
-    t_queued_pkt *pkt = (t_queued_pkt *)data;
-    
-    // Process any remaining data types that aren't handled immediately
-    // Note: Register responses (0x71) and streaming data (0x61) are now processed immediately
-    if (pkt->length >= 2) {
-        post("witsensor: unexpected data type: 0x%02X 0x%02X (length=%d)", 
-             pkt->bytes[0], pkt->bytes[1], pkt->length);
-    }
-    
-    free(pkt);
-}
-
 // Handle queued output messages on Pd scheduler thread
 static void witsensor_pd_output_handler(t_pd *obj, void *data) {
     if (!obj || !data) return;
@@ -432,6 +413,31 @@ static void witsensor_pd_output_handler(t_pd *obj, void *data) {
     }
     
     free(out);
+}
+
+// Handle connection status changes on Pd scheduler thread
+void witsensor_pd_connected_handler(t_pd *obj, void *data) {
+    if (!obj || !data) return;
+    t_witsensor *x = (t_witsensor *)obj;
+    t_queued_flag *flag = (t_queued_flag *)data;
+    
+    x->is_connected = flag->value;
+    
+    t_atom a;
+    SETFLOAT(&a, flag->value);
+    outlet_anything(x->status_out, gensym("connected"), 1, &a);
+    
+    if (!flag->value) {
+        // Device disconnected - stop polling
+        if (x->poll_interval > 0) {
+            post("witsensor: device disconnected, stopping %s polling", 
+                 x->poll_type ? x->poll_type->s_name : "unknown");
+            x->poll_interval = 0;
+            x->poll_type = NULL;
+        }
+    }
+    
+    free(flag);
 }
 
 // Scan for WIT devices (continuous until stopped or connected)
@@ -522,7 +528,6 @@ static void witsensor_set_rate(t_witsensor *x, t_float rate) {
         // Unlock sensor first
         unsigned char cmd_unlock[] = {0xFF, 0xAA, 0x69, 0x88, 0xB5}; // Unlock command
         witsensor_ble_simpleble_write_data(x->ble_data, cmd_unlock, sizeof(cmd_unlock));
-        usleep(100000); // 100ms delay
         
         // Map Hz to manual codes: 0x01:0.1, 0x02:0.5, 0x03:1, 0x04:2, 0x05:5,
         // 0x06:10, 0x07:20, 0x08:50, 0x09:100, 0x0B:200
@@ -538,9 +543,11 @@ static void witsensor_set_rate(t_witsensor *x, t_float rate) {
         else if (rate <= 150.0f) rate_code = 0x09;
         else rate_code = 0x0B; // 200Hz
 
+        // Unlock and send rate immediately
+        // Small spacing; sensor accepts back-to-back frames over BLE without blocking main thread
         unsigned char cmd_rate[] = {0xFF, 0xAA, 0x03, rate_code, 0x00};
         witsensor_ble_simpleble_write_data(x->ble_data, cmd_rate, sizeof(cmd_rate));
-        
+
         t_atom args[2];
         SETFLOAT(&args[0], rate);
         SETFLOAT(&args[1], rate_code);
@@ -655,10 +662,19 @@ static void witsensor_save(t_witsensor *x) {
 
 // Restore configuration: FF AA 00 01 00
 static void witsensor_restore(t_witsensor *x) {
-    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
-    post("witsensor: restoring configuration");
+    if (!x->is_connected || !x->ble_data) { 
+        post("witsensor: not connected to device"); 
+        return; 
+    }
+    
     unsigned char cmd[] = {0xFF, 0xAA, 0x00, 0x01, 0x00};
-    witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
+    int result = witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
+    
+    if (!result) {
+        post("witsensor: failed to send restore command");
+    } else {
+        post("witsensor: restore command sent successfully");
+    }
 }
 
 // Unified polling method: poll <type> <interval>
@@ -726,6 +742,7 @@ static void *witsensor_new(void) {
     x->should_stop = 0;
     x->poll_interval = 0;
     x->poll_type = NULL;
+    // no deferred state to init
     // new_streaming_data removed - using push mechanism
     x->temp_bytes_count = 0;
     x->pd_instance = pd_this;
@@ -804,14 +821,16 @@ static void witsensor_magcal_start(t_witsensor *x) {
     usleep(50000);
     unsigned char cmd_start[] = {0xFF, 0xAA, 0x01, 0x07, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_start, sizeof(cmd_start));
-    outlet_anything(x->status_out, gensym("magcal"), 1, (t_atom[]){(t_atom){.a_type=A_SYMBOL,.a_w.w_symbol=gensym("start")}});
+    t_atom a; SETSYMBOL(&a, gensym("start"));
+    outlet_anything(x->status_out, gensym("magcal"), 1, &a);
 }
 
 static void witsensor_magcal_stop(t_witsensor *x) {
     if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
     unsigned char cmd_stop[] = {0xFF, 0xAA, 0x01, 0x00, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_stop, sizeof(cmd_stop));
-    outlet_anything(x->status_out, gensym("magcal"), 1, (t_atom[]){(t_atom){.a_type=A_SYMBOL,.a_w.w_symbol=gensym("stop")}});
+    t_atom a; SETSYMBOL(&a, gensym("stop"));
+    outlet_anything(x->status_out, gensym("magcal"), 1, &a);
 }
 
 static void witsensor_zzero(t_witsensor *x) {

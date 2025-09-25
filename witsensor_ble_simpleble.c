@@ -7,8 +7,8 @@
  * See LICENSE for details
  */
 
-#include "m_pd.h"
 #include "witsensor_ble_simpleble.h"
+#include "m_pd.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -29,6 +29,7 @@ typedef struct _queued_flag { int value; } t_queued_flag;
 typedef struct _queued_device { char *tag; char *addr; char *id; } t_queued_device;
 void witsensor_pd_scanning_handler(t_pd *obj, void *data);
 void witsensor_pd_device_found_handler(t_pd *obj, void *data);
+void witsensor_pd_connected_handler(t_pd *obj, void *data);
 
 // Forward declaration for notification callback used in connect path
 static void simpleble_on_data_received(simpleble_peripheral_t peripheral, simpleble_uuid_t service, simpleble_uuid_t characteristic, const uint8_t *data, size_t length, void *user_data);
@@ -178,6 +179,25 @@ static void simpleble_on_data_received(simpleble_peripheral_t peripheral, simple
     }
     ble_data->data_count++;
     ble_data->last_data_time = time(NULL);
+}
+
+// Callback for disconnection events
+static void simpleble_on_disconnected(simpleble_peripheral_t peripheral, void *user_data) {
+    (void)peripheral;
+    witsensor_ble_simpleble_t *ble_data = (witsensor_ble_simpleble_t *)user_data;
+    if (!ble_data) return;
+    
+    post("WITSensorBLE: Device disconnected unexpectedly");
+    ble_data->is_connected = 0;
+    
+    // Notify Pd layer about disconnection
+    if (ble_data->pd_instance && ble_data->pd_obj) {
+        t_queued_flag *q = (t_queued_flag *)malloc(sizeof(t_queued_flag));
+        if (q) {
+            q->value = 0; // 0 = disconnected
+            pd_queue_mess((t_pdinstance*)ble_data->pd_instance, (t_pd*)ble_data->pd_obj, q, witsensor_pd_connected_handler);
+        }
+    }
 }
 
 // Create BLE data structure
@@ -382,6 +402,9 @@ int witsensor_ble_simpleble_connect_by_address(witsensor_ble_simpleble_t *ble_da
                     simpleble_uuid_t read_characteristic_uuid = {.value = WIT_READ_CHARACTERISTIC_UUID_STR};
                     simpleble_peripheral_notify(peripheral, service_uuid, read_characteristic_uuid, simpleble_on_data_received, ble_data);
                     
+                    // Set up disconnection callback
+                    simpleble_peripheral_set_callback_on_disconnected(peripheral, simpleble_on_disconnected, ble_data);
+                    
                     post("WITSensorBLE: Connected to device: %s", address);
                     simpleble_free(peripheral_address);
                     return 1;
@@ -428,6 +451,9 @@ int witsensor_ble_simpleble_connect_by_identifier(witsensor_ble_simpleble_t *ble
                 simpleble_uuid_t service_uuid = {.value = WIT_SERVICE_UUID_STR};
                 simpleble_uuid_t read_characteristic_uuid = {.value = WIT_READ_CHARACTERISTIC_UUID_STR};
                 simpleble_peripheral_notify(p, service_uuid, read_characteristic_uuid, simpleble_on_data_received, ble_data);
+                
+                // Set up disconnection callback
+                simpleble_peripheral_set_callback_on_disconnected(p, simpleble_on_disconnected, ble_data);
                 post("WITSensorBLE: Connected to %s", pid);
                 if (pid) simpleble_free(pid);
                 return 1;
@@ -475,6 +501,9 @@ int witsensor_ble_simpleble_connect(witsensor_ble_simpleble_t *ble_data) {
                 simpleble_uuid_t service_uuid = {.value = WIT_SERVICE_UUID_STR};
                 simpleble_uuid_t read_characteristic_uuid = {.value = WIT_READ_CHARACTERISTIC_UUID_STR};
                 simpleble_peripheral_notify(peripheral, service_uuid, read_characteristic_uuid, simpleble_on_data_received, ble_data);
+                
+                // Set up disconnection callback
+                simpleble_peripheral_set_callback_on_disconnected(peripheral, simpleble_on_disconnected, ble_data);
                 if (peripheral_address) simpleble_free(peripheral_address);
                 if (peripheral_identifier) simpleble_free(peripheral_identifier);
                 return 1;

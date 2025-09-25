@@ -67,6 +67,8 @@ int witsensor_ble_simpleble_ensure_initialized(witsensor_ble_simpleble_t *ble_da
 // macOS authorization preflight (bridged via Objective-C)
 int macos_bt_authorized_always(void);
 
+// (Pd handler declarations are kept in implementation to avoid header dependency)
+
 #ifdef __cplusplus
 }
 #endif
