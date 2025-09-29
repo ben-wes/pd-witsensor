@@ -54,9 +54,7 @@ void witsensor_ble_simpleble_start_scanning(witsensor_ble_simpleble_t *ble_data)
 void witsensor_ble_simpleble_stop_scanning(witsensor_ble_simpleble_t *ble_data);
 void witsensor_ble_simpleble_get_scan_results(witsensor_ble_simpleble_t *ble_data);
 void witsensor_ble_simpleble_clear_scan_results(witsensor_ble_simpleble_t *ble_data);
-int witsensor_ble_simpleble_connect(witsensor_ble_simpleble_t *ble_data);
-int witsensor_ble_simpleble_connect_by_address(witsensor_ble_simpleble_t *ble_data, const char *address);
-int witsensor_ble_simpleble_connect_by_identifier(witsensor_ble_simpleble_t *ble_data, const char *identifier);
+int witsensor_ble_simpleble_connect(witsensor_ble_simpleble_t *ble_data, const char *target);
 void witsensor_ble_simpleble_disconnect(witsensor_ble_simpleble_t *ble_data);
 int witsensor_ble_simpleble_write_data(witsensor_ble_simpleble_t *ble_data, const unsigned char *data, int length);
 int witsensor_ble_simpleble_is_connected(witsensor_ble_simpleble_t *ble_data);
