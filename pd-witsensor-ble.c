@@ -238,45 +238,69 @@ static void witsensor_process_register_response(t_witsensor *x, unsigned char *d
         return;
     }
     if (start == 0x2E && length >= 6) {
-        // VERSION1
         uint16_t v1 = (uint16_t)(data[4] | (data[5] << 8));
-        t_atom a; SETFLOAT(&a, (t_float)v1);
-        outlet_anything(x->status_out, gensym("version1"), 1, &a);
+        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
+        if (out) {
+            out->msg = gensym("version1");
+            out->argc = 1;
+            SETFLOAT(&out->argv[0], (t_float)v1);
+            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+        }
         return;
     }
     if (start == 0x2F && length >= 6) {
-        // VERSION2
         uint16_t v2 = (uint16_t)(data[4] | (data[5] << 8));
-        t_atom a; SETFLOAT(&a, (t_float)v2);
-        outlet_anything(x->status_out, gensym("version2"), 1, &a);
+        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
+        if (out) {
+            out->msg = gensym("version2");
+            out->argc = 1;
+            SETFLOAT(&out->argv[0], (t_float)v2);
+            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+        }
         return;
     }
     if (start == 0x30 && length >= 6) {
-        // YYMM
         uint16_t yymm = (uint16_t)(data[4] | (data[5] << 8));
-        t_atom a; SETFLOAT(&a, (t_float)yymm);
-        outlet_anything(x->status_out, gensym("time_yymm"), 1, &a);
+        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
+        if (out) {
+            out->msg = gensym("time_yymm");
+            out->argc = 1;
+            SETFLOAT(&out->argv[0], (t_float)yymm);
+            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+        }
         return;
     }
     if (start == 0x31 && length >= 6) {
-        // DDH
         uint16_t ddh = (uint16_t)(data[4] | (data[5] << 8));
-        t_atom a; SETFLOAT(&a, (t_float)ddh);
-        outlet_anything(x->status_out, gensym("time_ddh"), 1, &a);
+        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
+        if (out) {
+            out->msg = gensym("time_ddh");
+            out->argc = 1;
+            SETFLOAT(&out->argv[0], (t_float)ddh);
+            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+        }
         return;
     }
     if (start == 0x32 && length >= 6) {
-        // MMSS
         uint16_t mmss = (uint16_t)(data[4] | (data[5] << 8));
-        t_atom a; SETFLOAT(&a, (t_float)mmss);
-        outlet_anything(x->status_out, gensym("time_mmss"), 1, &a);
+        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
+        if (out) {
+            out->msg = gensym("time_mmss");
+            out->argc = 1;
+            SETFLOAT(&out->argv[0], (t_float)mmss);
+            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+        }
         return;
     }
     if (start == 0x33 && length >= 6) {
-        // MS
         uint16_t ms = (uint16_t)(data[4] | (data[5] << 8));
-        t_atom a; SETFLOAT(&a, (t_float)ms);
-        outlet_anything(x->status_out, gensym("time_ms"), 1, &a);
+        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
+        if (out) {
+            out->msg = gensym("time_ms");
+            out->argc = 1;
+            SETFLOAT(&out->argv[0], (t_float)ms);
+            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+        }
         return;
     }
 }
@@ -481,6 +505,18 @@ static void witsensor_pd_output_handler(t_pd *obj, void *data) {
         witsensor_send_quaternion_data(x);
     } else if (out->msg == gensym("streaming")) {
         witsensor_send_sensor_data(x);
+    } else if (out->msg == gensym("version1")) {
+        outlet_anything(x->status_out, out->msg, out->argc, out->argv);
+    } else if (out->msg == gensym("version2")) {
+        outlet_anything(x->status_out, out->msg, out->argc, out->argv);
+    } else if (out->msg == gensym("time_yymm")) {
+        outlet_anything(x->status_out, out->msg, out->argc, out->argv);
+    } else if (out->msg == gensym("time_ddh")) {
+        outlet_anything(x->status_out, out->msg, out->argc, out->argv);
+    } else if (out->msg == gensym("time_mmss")) {
+        outlet_anything(x->status_out, out->msg, out->argc, out->argv);
+    } else if (out->msg == gensym("time_ms")) {
+        outlet_anything(x->status_out, out->msg, out->argc, out->argv);
     }
     
     free(out);
