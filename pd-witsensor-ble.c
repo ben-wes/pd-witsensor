@@ -80,6 +80,8 @@ typedef struct _witsensor {
     
     // Pd instance for pd_queue_mess
     t_pdinstance *pd_instance;
+    // Autoconnect state: pending_target == NULL → none, "*" → any WIT, else exact match
+    t_symbol *pending_target;
     
 } t_witsensor;
 
@@ -88,7 +90,7 @@ t_class *witsensor_class;
 // Forward declarations
 static void witsensor_scan_devices(t_witsensor *x);
 static void witsensor_get_scan_results(t_witsensor *x);
-static void witsensor_connect_device(t_witsensor *x, t_symbol *device_name);
+static void witsensor_connect(t_witsensor *x, t_symbol *s, int argc, t_atom *argv);
 static void witsensor_disconnect(t_witsensor *x);
 static void witsensor_process_register_response(t_witsensor *x, unsigned char *data, int length);
 static void witsensor_process_streaming_data(t_witsensor *x, unsigned char *data, int length);
@@ -103,7 +105,7 @@ static void witsensor_save(t_witsensor *x);
 static void witsensor_restore(t_witsensor *x);
 static void witsensor_read_version(t_witsensor *x);
 static void witsensor_read_time(t_witsensor *x);
-static void witsensor_clear(t_witsensor *x);
+static void witsensor_reset(t_witsensor *x);
 // pd_queue_mess marshaling
 typedef struct _queued_output { 
     t_symbol *msg; 
@@ -347,6 +349,30 @@ void witsensor_pd_device_found_handler(t_pd *obj, void *data) {
     t_witsensor *x = (t_witsensor *)obj;
     t_queued_device *d = (t_queued_device *)data;
     if (x && d) {
+        if (x->pending_target && !x->is_connected) {
+            int should_connect = 0;
+            const char *target = x->pending_target->s_name;
+            if (target && target[0] && strcmp(target, "*") != 0) {
+                if ((d->id && strcmp(d->id, target) == 0) || (d->addr && strcmp(d->addr, target) == 0)) {
+                    should_connect = 1;
+                }
+            } else if (target && strcmp(target, "*") == 0) {
+                if (d->tag && strcmp(d->tag, "wit") == 0) {
+                    should_connect = 1;
+                }
+            }
+            if (should_connect && d->id) {
+                // Reuse Pd-level connect (A_GIMME signature)
+                t_atom a[1];
+                SETSYMBOL(&a[0], gensym(d->id));
+                witsensor_connect(x, &s_, 1, a);
+                if (d->tag) free(d->tag);
+                if (d->addr) free(d->addr);
+                if (d->id) free(d->id);
+                free(d);
+                return;
+            }
+        }
         t_atom a[3];
         SETSYMBOL(&a[0], gensym(d->tag ? d->tag : "other"));
         SETSYMBOL(&a[1], gensym(d->addr ? d->addr : ""));
@@ -566,16 +592,42 @@ static void witsensor_get_scan_results(t_witsensor *x) {
 }
 
 // Connect to device by name or address
-static void witsensor_connect_device(t_witsensor *x, t_symbol *device_identifier) {
+static void witsensor_connect(t_witsensor *x, t_symbol *s, int argc, t_atom *argv) {
+    (void)s;
+    t_symbol *device_identifier = NULL;
+    if (argc > 0 && argv[0].a_type == A_SYMBOL) device_identifier = argv[0].a_w.w_symbol;
     if (device_identifier && device_identifier->s_name) {
         strcpy(x->device_name, device_identifier->s_name);
+    } else {
+        x->device_name[0] = '\0';
     }
     
     post("witsensor: connecting to device: %s", x->device_name);
     
+    // If already connected, do nothing to avoid surprising implicit disconnects
+    if (x->is_connected) {
+        post("witsensor: already connected; disconnect first to connect to a new device");
+        x->pending_target = NULL; // cancel any pending autoconnect
+        return;
+    }
+
     if (x->ble_data) {
-        // Unified connect: tries address or identifier
-        int connected = witsensor_ble_simpleble_connect(x->ble_data, x->device_name);
+        int connected = 0;
+        if (x->device_name[0]) {
+            // Try immediate targeted connect
+            connected = witsensor_ble_simpleble_connect(x->ble_data, x->device_name);
+        } else {
+            // No target specified: try current cached results for first WIT device
+            if (x->ble_data->cached_ids && x->ble_data->cached_count > 0) {
+                for (unsigned long i = 0; i < x->ble_data->cached_count; i++) {
+                    const char *id = x->ble_data->cached_ids[i];
+                    if (id && strstr(id, "WT") != NULL) {
+                        connected = witsensor_ble_simpleble_connect(x->ble_data, id);
+                        if (connected) break;
+                    }
+                }
+            }
+        }
         
         if (connected) {
             x->is_connected = 1;
@@ -614,7 +666,11 @@ static void witsensor_connect_device(t_witsensor *x, t_symbol *device_identifier
             outlet_anything(x->status_out, gensym("bandwidth"), 1, &bw);
             x->poll_interval = 0;
         } else {
-            post("witsensor: failed to connect to device: %s", x->device_name);
+            post("witsensor: starting autoconnect...");
+            x->pending_target = gensym(x->device_name[0] ? x->device_name : "*");
+            if (!witsensor_ble_simpleble_is_scanning(x->ble_data)) {
+                witsensor_ble_simpleble_start_scanning(x->ble_data);
+            }
         }
         return;
     } else {
@@ -758,8 +814,8 @@ static void witsensor_read_time(t_witsensor *x) {
     witsensor_ble_simpleble_write_data(x->ble_data, c33, sizeof(c33));
 }
 
-// Clear cached scan results (Pd message: clear)
-static void witsensor_clear(t_witsensor *x) {
+// Clear cached scan results (Pd message: reset)
+static void witsensor_reset(t_witsensor *x) {
     if (!x || !x->ble_data) { post("witsensor: BLE not initialized"); return; }
     // Stop scanning if active
     if (witsensor_ble_simpleble_is_scanning(x->ble_data)) {
@@ -1029,7 +1085,7 @@ void witsensor_setup(void) {
     
     class_addmethod(witsensor_class, (t_method)witsensor_scan_devices, gensym("scan"), 0);
     class_addmethod(witsensor_class, (t_method)witsensor_get_scan_results, gensym("results"), 0);
-    class_addmethod(witsensor_class, (t_method)witsensor_connect_device, gensym("connect"), A_SYMBOL, 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_connect, gensym("connect"), A_GIMME, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_disconnect, gensym("disconnect"), 0);
     class_addmethod(witsensor_class, (t_method)witsensor_poll, gensym("poll"), A_SYMBOL, A_DEFFLOAT, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_set_rate, gensym("rate"), A_FLOAT, 0);
@@ -1054,7 +1110,7 @@ void witsensor_setup(void) {
     class_addmethod(witsensor_class, (t_method)witsensor_save, gensym("save"), 0);
     class_addmethod(witsensor_class, (t_method)witsensor_restore, gensym("restore"), 0);
     class_addmethod(witsensor_class, (t_method)witsensor_set_baud, gensym("baud"), A_DEFFLOAT, 0);
-    class_addmethod(witsensor_class, (t_method)witsensor_clear, gensym("clear"), 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_reset, gensym("reset"), 0);
     
     witsensor_version();
 }

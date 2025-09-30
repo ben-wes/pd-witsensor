@@ -358,6 +358,23 @@ int witsensor_ble_simpleble_connect(witsensor_ble_simpleble_t *ble_data, const c
         return 0;
     }
 
+    // Require that target exists in our cached results to honor 'reset'
+    int in_cached = 0;
+    if (ble_data->cached_ids && ble_data->cached_addrs && ble_data->cached_count > 0) {
+        for (unsigned long i = 0; i < ble_data->cached_count; i++) {
+            const char *cid = ble_data->cached_ids[i];
+            const char *caddr = ble_data->cached_addrs[i];
+            if ((cid && strcmp(cid, target) == 0) || (caddr && strcmp(caddr, target) == 0)) {
+                in_cached = 1;
+                break;
+            }
+        }
+    }
+    if (!in_cached) {
+        post("WITSensorBLE: Target not in cached results; start scan to populate results before connecting");
+        return 0;
+    }
+
     size_t count = simpleble_adapter_scan_get_results_count(ble_data->adapter);
     for (size_t i = 0; i < count; i++) {
         simpleble_peripheral_t p = simpleble_adapter_scan_get_results_handle(ble_data->adapter, i);
