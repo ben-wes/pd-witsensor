@@ -1,6 +1,9 @@
 # library name
 lib.name = witsensor
 
+# Helper variables for Makefile string manipulation
+space := $(subst ,, )
+
 # Pure Data path (use newer version)
 PD_PATH = /Applications/Pd-0.56-1.app/Contents/Resources/src
 # Allow overriding via environment; default to PD_PATH
@@ -92,7 +95,8 @@ endif
 
 $(SIMPLEBLE_STATIC_LIBS):
 	git submodule update --init --recursive
-	cd $(SIMPLEBLE_DIR) && cmake -S . -B build-static -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+	# Build SimpleBLE for the target architecture(s). Convert space-separated arch list to semicolon-separated for CMake.
+	cd $(SIMPLEBLE_DIR) && cmake -S . -B build-static -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF $(if $(arch),-DCMAKE_OSX_ARCHITECTURES="$(subst $(space),;,$(arch))",)
 	$(MAKE) -C $(SIMPLEBLE_STATIC_DIR) -j$(shell sysctl -n hw.ncpu 2>/dev/null || nproc)
 
 $(SIMPLEBLE_SHARED_LIBS):

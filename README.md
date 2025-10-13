@@ -30,6 +30,21 @@ make deps && make
 
 Note: On macOS we link SimpleBLE statically; on Linux we use the shared build tree. The same commands above handle both.
 
+#### Cross-compiling for specific architectures (macOS)
+
+```bash
+# Build for x86_64 (Intel)
+make deps arch=x86_64 && make arch=x86_64
+
+# Build for arm64 (Apple Silicon)
+make deps arch=arm64 && make arch=arm64
+
+# Build universal binary (both architectures)
+make deps arch="x86_64 arm64" && make arch="x86_64 arm64"
+```
+
+The `arch` parameter ensures SimpleBLE is built for the correct architecture(s). This is particularly important for CI/CD systems that might cross-compile on Apple Silicon runners.
+
 ### Usage (Pd)
 
 ```pd

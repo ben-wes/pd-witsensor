@@ -65,7 +65,7 @@ jobs:
       - name: Build (make deps && make install)
         run: |
           ARCH=${{ matrix.arch == 'amd64' && 'x86_64' || matrix.arch }}
-          make deps
+          make deps arch=${ARCH}
           if [ ${{ matrix.floatsize }} -eq 32 ]; then
             make install PDLIBDIR=${{ env.PDLIBDIR }} floatsize=${{ matrix.floatsize }} extension=d_${{ matrix.arch }} arch=${ARCH}
           else
