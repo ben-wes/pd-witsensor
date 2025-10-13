@@ -103,7 +103,7 @@
 #X connect 6 0 4 0;
 #X connect 7 0 4 1;
 #X restore 352 649 pd z_from_gyro;
-#N canvas 92 117 554 243 additional 0;
+#N canvas 92 117 673 318 additional 0;
 #X msg 50 42 save;
 #X msg 90 42 restore;
 #X msg 48 85 baud \$1;
@@ -112,12 +112,15 @@
 #X text 104 83 sets the baud rate \, which doesn't have any effect and is fixed on the device side anyway;
 #X text 142 42 save current settings to flash or restore to defaults;
 #X text 124 130 single shot polls;
-#X obj 52 178 outlet;
+#X obj 51 248 outlet;
+#X msg 66 189 setname WTbla;
+#X text 156 190 EXPERIMENTAL! use at own risk and probably won't work;
 #X connect 0 0 8 0;
 #X connect 1 0 8 0;
 #X connect 2 0 8 0;
 #X connect 3 0 8 0;
 #X connect 4 0 8 0;
+#X connect 9 0 8 0;
 #X restore 277 450 pd additional messages;
 #X obj 41 435 t a;
 #X obj 41 466 t a;
@@ -238,7 +241,6 @@
 #X connect 13 0 6 0;
 #X connect 14 0 5 0;
 #X restore 92 588 pd more stuff;
-#X msg 455 323 setname WTTAMLAB00 3;
 #X connect 0 0 1 0;
 #X connect 0 1 2 0;
 #X connect 0 2 3 0;
@@ -330,4 +332,3 @@
 #X connect 132 0 131 0;
 #X connect 133 0 132 0;
 #X connect 134 0 131 0;
-#X connect 136 0 129 0;
