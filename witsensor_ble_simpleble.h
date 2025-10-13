@@ -57,6 +57,10 @@ void witsensor_ble_simpleble_clear_scan_results(witsensor_ble_simpleble_t *ble_d
 int witsensor_ble_simpleble_connect(witsensor_ble_simpleble_t *ble_data, const char *target);
 void witsensor_ble_simpleble_disconnect(witsensor_ble_simpleble_t *ble_data);
 int witsensor_ble_simpleble_write_data(witsensor_ble_simpleble_t *ble_data, const unsigned char *data, int length);
+// Write via GATT write request (with response) to WIT write characteristic
+int witsensor_ble_simpleble_write_request_raw(witsensor_ble_simpleble_t *ble_data, const unsigned char *data, int length);
+// Enable/disable notifications on the WIT read characteristic
+int witsensor_ble_simpleble_set_notifications_enabled(witsensor_ble_simpleble_t *ble_data, int enabled);
 int witsensor_ble_simpleble_is_connected(witsensor_ble_simpleble_t *ble_data);
 int witsensor_ble_simpleble_is_scanning(witsensor_ble_simpleble_t *ble_data);
 // Permission probe: returns number of devices found after a short bounded scan,

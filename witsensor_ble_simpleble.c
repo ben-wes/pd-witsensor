@@ -40,6 +40,7 @@ static void simpleble_on_data_received(simpleble_peripheral_t peripheral, simple
 static simpleble_uuid_t WIT_SERVICE_UUID = {.value = WIT_SERVICE_UUID_STR};
 /* unused: static simpleble_uuid_t WIT_READ_CHARACTERISTIC_UUID = {.value = WIT_READ_CHARACTERISTIC_UUID_STR}; */
 static simpleble_uuid_t WIT_WRITE_CHARACTERISTIC_UUID = {.value = WIT_WRITE_CHARACTERISTIC_UUID_STR};
+static simpleble_uuid_t WIT_READ_CHARACTERISTIC_UUID = {.value = WIT_READ_CHARACTERISTIC_UUID_STR};
 
 // Forward declarations
 
@@ -447,6 +448,40 @@ int witsensor_ble_simpleble_write_data(witsensor_ble_simpleble_t *ble_data, cons
         
     // Send data to WIT sensor using write characteristic
     simpleble_peripheral_write_command(ble_data->peripheral, WIT_SERVICE_UUID, WIT_WRITE_CHARACTERISTIC_UUID, data, length);
+    return 1;
+}
+
+// Write via request (with response) to ensure delivery semantics for config/ASCII commands
+int witsensor_ble_simpleble_write_request_raw(witsensor_ble_simpleble_t *ble_data, const unsigned char *data, int length) {
+    if (!ble_data || !data || length <= 0) return 0;
+    if (!ble_data->is_connected || !ble_data->peripheral) {
+        post("WITSensorBLE: Not connected to device");
+        return 0;
+    }
+    simpleble_err_t err = simpleble_peripheral_write_request(
+        ble_data->peripheral,
+        WIT_SERVICE_UUID,
+        WIT_WRITE_CHARACTERISTIC_UUID,
+        data,
+        (uint16_t)length);
+    return (err == SIMPLEBLE_SUCCESS) ? 1 : 0;
+}
+
+int witsensor_ble_simpleble_set_notifications_enabled(witsensor_ble_simpleble_t *ble_data, int enabled) {
+    if (!ble_data || !ble_data->peripheral) return 0;
+    if (enabled) {
+        simpleble_peripheral_notify(
+            ble_data->peripheral,
+            WIT_SERVICE_UUID,
+            WIT_READ_CHARACTERISTIC_UUID,
+            simpleble_on_data_received,
+            ble_data);
+    } else {
+        simpleble_peripheral_unsubscribe(
+            ble_data->peripheral,
+            WIT_SERVICE_UUID,
+            WIT_READ_CHARACTERISTIC_UUID);
+    }
     return 1;
 }
 

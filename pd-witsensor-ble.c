@@ -82,6 +82,9 @@ typedef struct _witsensor {
     t_pdinstance *pd_instance;
     // Autoconnect state: pending_target == NULL → none, "*" → any WIT, else exact match
     t_symbol *pending_target;
+    // Dedupe device announcements per scan
+    char **seen_ids;
+    unsigned long seen_count;
     
 } t_witsensor;
 
@@ -106,6 +109,7 @@ static void witsensor_restore(t_witsensor *x);
 static void witsensor_read_version(t_witsensor *x);
 static void witsensor_read_time(t_witsensor *x);
 static void witsensor_reset(t_witsensor *x);
+static void witsensor_setname(t_witsensor *x, t_symbol *s, int argc, t_atom *argv);
 // pd_queue_mess marshaling
 typedef struct _queued_output { 
     t_symbol *msg; 
@@ -338,6 +342,8 @@ void witsensor_pd_scanning_handler(t_pd *obj, void *data) {
     t_witsensor *x = (t_witsensor *)obj;
     t_queued_flag *q = (t_queued_flag *)data;
     if (x && q) {
+        // Update internal scanning flag so autoconnect gating reflects actual state
+        x->is_scanning = q->value;
         t_atom a; SETFLOAT(&a, (t_float)q->value);
         outlet_anything(x->status_out, gensym("scanning"), 1, &a);
     }
@@ -349,7 +355,22 @@ void witsensor_pd_device_found_handler(t_pd *obj, void *data) {
     t_witsensor *x = (t_witsensor *)obj;
     t_queued_device *d = (t_queued_device *)data;
     if (x && d) {
-        if (x->pending_target && !x->is_connected) {
+        // Dedupe in current session
+        if (d->id) {
+            int seen = 0;
+            for (unsigned long i = 0; i < x->seen_count; i++) {
+                if (x->seen_ids && x->seen_ids[i] && strcmp(x->seen_ids[i], d->id) == 0) { seen = 1; break; }
+            }
+            if (!seen) {
+                char **new_ids = (char**)realloc(x->seen_ids, (x->seen_count + 1) * sizeof(char*));
+                if (new_ids) {
+                    x->seen_ids = new_ids;
+                    x->seen_ids[x->seen_count] = strdup(d->id);
+                    x->seen_count++;
+                }
+            }
+        }
+        if (x->pending_target && !x->is_connected && x->is_scanning) {
             int should_connect = 0;
             const char *target = x->pending_target->s_name;
             if (target && target[0] && strcmp(target, "*") != 0) {
@@ -362,10 +383,21 @@ void witsensor_pd_device_found_handler(t_pd *obj, void *data) {
                 }
             }
             if (should_connect && d->id) {
+                // Emit device status before autoconnect so UI sees the WIT
+                t_atom da[3];
+                SETSYMBOL(&da[0], gensym(d->tag ? d->tag : "other"));
+                SETSYMBOL(&da[1], gensym(d->addr ? d->addr : ""));
+                SETSYMBOL(&da[2], gensym(d->id));
+                outlet_anything(x->status_out, gensym("device"), 3, da);
+                // Emit autoconnecting notice
+                t_atom ac[1]; SETSYMBOL(&ac[0], gensym(d->id));
+                outlet_anything(x->status_out, gensym("autoconnecting"), 1, ac);
                 // Reuse Pd-level connect (A_GIMME signature)
                 t_atom a[1];
                 SETSYMBOL(&a[0], gensym(d->id));
                 witsensor_connect(x, &s_, 1, a);
+                // Clear pending_target after initiating connect to avoid duplicate autoconnects
+                x->pending_target = NULL;
                 if (d->tag) free(d->tag);
                 if (d->addr) free(d->addr);
                 if (d->id) free(d->id);
@@ -580,6 +612,13 @@ static void witsensor_scan_devices(t_witsensor *x) {
     
     // Reset scan results list
     witsensor_ble_simpleble_clear_scan_results(x->ble_data);
+    // Reset dedupe list
+    if (x->seen_ids) {
+        for (unsigned long i = 0; i < x->seen_count; i++) free(x->seen_ids[i]);
+        free(x->seen_ids);
+        x->seen_ids = NULL;
+        x->seen_count = 0;
+    }
     
     // Continuous scanning (no timeout needed)
     witsensor_ble_simpleble_start_scanning(x->ble_data);
@@ -631,6 +670,8 @@ static void witsensor_connect(t_witsensor *x, t_symbol *s, int argc, t_atom *arg
         
         if (connected) {
             x->is_connected = 1;
+            // Clear pending autoconnect since we achieved a connection
+            x->pending_target = NULL;
             t_atom a; SETFLOAT(&a, 1);
             outlet_anything(x->status_out, gensym("connected"), 1, &a);
             // On-connect configuration: set desired streaming/output mode consistently for Pd usage
@@ -686,6 +727,8 @@ static void witsensor_disconnect(t_witsensor *x) {
     }
     
     if (x->ble_data) {
+        // Cancel any pending autoconnect so subsequent 'results' won't reconnect implicitly
+        x->pending_target = NULL;
         witsensor_ble_simpleble_disconnect(x->ble_data);
         x->should_stop = 1;
     }
@@ -822,6 +865,12 @@ static void witsensor_reset(t_witsensor *x) {
         witsensor_ble_simpleble_stop_scanning(x->ble_data);
     }
     witsensor_ble_simpleble_clear_scan_results(x->ble_data);
+    if (x->seen_ids) {
+        for (unsigned long i = 0; i < x->seen_count; i++) free(x->seen_ids[i]);
+        free(x->seen_ids);
+        x->seen_ids = NULL;
+        x->seen_count = 0;
+    }
 }
 
 // Set angle reference (zero): FF AA 01 08 00
@@ -955,9 +1004,11 @@ static void *witsensor_new(void) {
     // Tracked state defaults
     x->axis_mode = 0;
     x->output_mode = -1;
-    // new_streaming_data removed - using push mechanism
     x->temp_bytes_count = 0;
     x->pd_instance = pd_this;
+    x->pending_target = NULL;
+    x->seen_ids = NULL;
+    x->seen_count = 0;
     
     // Initialize BLE system with crash protection
     post("witsensor: initializing BLE system...");
@@ -983,17 +1034,27 @@ static void *witsensor_new(void) {
     x->use_disp_speed = 0;
     x->use_timestamp = 0;
     
-    // Streaming data monitoring removed - using push mechanism
-    
     return (void *)x;
 }
 
 // Destructor
 static void witsensor_free(t_witsensor *x) {
+    // Stop scanning first to avoid callbacks firing after free
+    if (x->ble_data && witsensor_ble_simpleble_is_scanning(x->ble_data)) {
+        witsensor_ble_simpleble_stop_scanning(x->ble_data);
+    }
+    // Disconnect device
     witsensor_disconnect(x);
     pd_queue_cancel((t_pd *)x);
     if (x->ble_data) {
         witsensor_ble_simpleble_destroy(x->ble_data);
+    }
+    // Free dedupe list
+    if (x->seen_ids) {
+        for (unsigned long i = 0; i < x->seen_count; i++) free(x->seen_ids[i]);
+        free(x->seen_ids);
+        x->seen_ids = NULL;
+        x->seen_count = 0;
     }
     clock_free(x->poll_clock);
 }
@@ -1111,6 +1172,82 @@ void witsensor_setup(void) {
     class_addmethod(witsensor_class, (t_method)witsensor_restore, gensym("restore"), 0);
     class_addmethod(witsensor_class, (t_method)witsensor_set_baud, gensym("baud"), A_DEFFLOAT, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_reset, gensym("reset"), 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_setname, gensym("setname"), A_GIMME, 0);
     
     witsensor_version();
+}
+
+// Set Bluetooth name via vendor ASCII command with selectable variant
+// Usage: setname <editable_part> [variant]
+//   variant 1: "WT %s \r\n" (space before and after name, CRLF) [default per docs]
+//   variant 2: "WT %s\r\n"  (space, CRLF)
+//   variant 3: "WT%s\r\n"   (no space, CRLF)
+static void witsensor_setname(t_witsensor *x, t_symbol *s, int argc, t_atom *argv) {
+    (void)s;
+    if (!x || !x->ble_data || !x->is_connected) { post("witsensor: not connected to device"); return; }
+    if (argc < 1 || argv[0].a_type != A_SYMBOL) { post("witsensor: setname requires a symbol argument"); return; }
+    const char *input = argv[0].a_w.w_symbol ? argv[0].a_w.w_symbol->s_name : NULL;
+    if (!input || !input[0]) { post("witsensor: setname requires non-empty name"); return; }
+    
+    int variant = 1;
+    if (argc >= 2 && argv[1].a_type == A_FLOAT) {
+        int v = (int)atom_getfloat(&argv[1]);
+        if (v >= 1 && v <= 3) variant = v;
+    }
+
+    // Build full name: 'WT' + up to 14 non-space chars from editable; strip leading 'WT'
+    const char *editable = input;
+    if (editable[0] == 'W' && editable[1] == 'T') editable += 2;
+    char full_name[20];
+    size_t fn = 0;
+    full_name[fn++] = 'W';
+    full_name[fn++] = 'T';
+    size_t editable_nonspace = 0;
+    for (size_t i = 0; editable[i] != '\0' && fn < 16; i++) {
+        char c = editable[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') continue;
+        editable_nonspace++;
+        full_name[fn++] = c;
+    }
+    full_name[fn] = '\0';
+    if (editable_nonspace > 14) {
+        post("witsensor: setname truncated to 14 chars: %s", full_name);
+    }
+    
+    post("witsensor: setname starting - variant %d, name: %s", variant, full_name);
+    
+    // Unlock
+    unsigned char unlock[] = {0xFF, 0xAA, 0x69, 0x88, 0xB5};
+    witsensor_ble_simpleble_write_data(x->ble_data, unlock, sizeof(unlock));
+    usleep(100000);  // Increased delay
+    
+    // Build ASCII command per variant
+    char cmd[64];
+    int n = 0;
+    if (variant == 1) {
+        n = snprintf(cmd, sizeof(cmd), "WT %s \r\n", full_name);
+    } else if (variant == 2) {
+        n = snprintf(cmd, sizeof(cmd), "WT %s\r\n", full_name);
+    } else {
+        n = snprintf(cmd, sizeof(cmd), "WT%s\r\n", full_name);
+    }
+    
+    if (n > 0) {
+        // Debug: print the exact bytes being sent
+        post("witsensor: sending ASCII command: '%s' (length: %d)", cmd, n);
+        for (int i = 0; i < n; i++) {
+            post("  byte[%d] = 0x%02X ('%c')", i, (unsigned char)cmd[i], (cmd[i] >= 32 && cmd[i] <= 126) ? cmd[i] : '.');
+        }
+        
+        // Use write-request to ensure correct length and delivery semantics
+        witsensor_ble_simpleble_write_request_raw(x->ble_data, (const unsigned char*)cmd, n);
+        
+        // Send save immediately - no delay to avoid device timeout/reboot
+        usleep(10000);  // Minimal delay
+        post("witsensor: sending save command immediately");
+        unsigned char save[] = {0xFF, 0xAA, 0x00, 0x00, 0x00};
+        witsensor_ble_simpleble_write_data(x->ble_data, save, sizeof(save));
+    }
+    
+    post("witsensor: setname complete - expect disconnect/reboot");
 }
