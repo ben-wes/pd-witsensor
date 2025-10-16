@@ -35,7 +35,8 @@ define forLinux
 endef
 
 define forWindows
-	ldlibs += -L./SimpleBLE/simplecble/build -Wl,--whole-archive -lsimplecble -lsimpleble -Wl,--no-whole-archive
+	# Link against static libs built by SimpleBLE (similar to macOS)
+	ldlibs += -L./SimpleBLE/simplecble/build-windows/lib -Wl,--whole-archive,./SimpleBLE/simplecble/build-windows/lib/libsimplecble.a,./SimpleBLE/simplecble/build-windows/lib/libsimpleble.a,--no-whole-archive -lws2_32 -liphlpapi -lole32 -lsetupapi
 endef
 
 # data files
@@ -73,12 +74,16 @@ SIMPLEBLE_SHARED_DIR=$(SIMPLEBLE_DIR)/build
 
 SIMPLEBLE_STATIC_LIBS=$(SIMPLEBLE_STATIC_DIR)/lib/libsimplecble.a $(SIMPLEBLE_STATIC_DIR)/lib/libsimpleble.a
 SIMPLEBLE_SHARED_LIBS=$(SIMPLEBLE_SHARED_DIR)/lib/libsimplecble.a $(SIMPLEBLE_SHARED_DIR)/lib/libsimpleble.a
+SIMPLEBLE_WINDOWS_LIBS=$(SIMPLEBLE_DIR)/build-windows/lib/libsimplecble.a $(SIMPLEBLE_DIR)/build-windows/lib/libsimpleble.a
 
 # Ensure the macOS external links against locally built static libs
 witsensor.pd_darwin: $(SIMPLEBLE_STATIC_LIBS)
 
 # Ensure Linux externals depend on built SimpleBLE (shared build tree)
 witsensor.pd_linux: $(SIMPLEBLE_SHARED_LIBS)
+
+# Ensure Windows externals depend on built SimpleBLE (static build tree)
+%.dll: $(SIMPLEBLE_WINDOWS_LIBS)
 
 # Platform detection for deps target
 UNAME_S := $(shell uname -s)
@@ -88,6 +93,8 @@ ifeq ($(UNAME_S),Darwin)
 deps: $(SIMPLEBLE_STATIC_LIBS)
 else ifeq ($(UNAME_S),Linux)
 deps: $(SIMPLEBLE_SHARED_LIBS)
+else ifeq ($(OS),Windows_NT)
+deps: $(SIMPLEBLE_WINDOWS_LIBS)
 else
 deps:
 	@echo "No deps to build for this platform."
@@ -103,3 +110,8 @@ $(SIMPLEBLE_SHARED_LIBS):
 	git submodule update --init --recursive
 	cd $(SIMPLEBLE_DIR) && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON
 	$(MAKE) -C $(SIMPLEBLE_SHARED_DIR) -j$(shell sysctl -n hw.ncpu 2>/dev/null || nproc)
+
+$(SIMPLEBLE_WINDOWS_LIBS):
+	git submodule update --init --recursive
+	cd $(SIMPLEBLE_DIR) && cmake -S . -B build-windows -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -G "MSYS Makefiles"
+	$(MAKE) -C $(SIMPLEBLE_DIR)/build-windows -j$(shell nproc 2>/dev/null || echo 4)
