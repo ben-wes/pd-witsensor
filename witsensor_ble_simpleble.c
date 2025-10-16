@@ -14,7 +14,11 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <time.h>
-#include <pthread.h>
+
+// Platform-specific includes
+#ifndef _WIN32
+    #include <pthread.h>
+#endif
 
 // SimpleBLE includes - use simplecble headers directly
 #include <simplecble/simpleble.h>

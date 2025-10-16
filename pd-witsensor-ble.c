@@ -9,9 +9,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <pthread.h>
 #include <time.h>
+
+// Platform-specific includes
+#ifdef _WIN32
+    #include <windows.h>
+    #define usleep(x) Sleep((x)/1000)  // usleep takes microseconds, Sleep takes milliseconds
+#else
+    #include <unistd.h>
+    #include <pthread.h>
+#endif
 
 #include "m_pd.h"
 
@@ -57,9 +64,11 @@ typedef struct _witsensor {
     int use_disp_speed;          // 0: accel/gyro, 1: disp/speed
     int use_timestamp;   // 0: angle trio, 1: timestamp(+rz)
 
-    // Threading
+    // Threading (legacy - not currently used)
+#ifndef _WIN32
     pthread_t scan_thread;
     pthread_t data_thread;
+#endif
     int should_stop;
     
     // PureData outlets
