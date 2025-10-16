@@ -78,45 +78,78 @@ jobs:
           name: ${{env.LIBNAME}}-${{ matrix.os }}-${{ matrix.arch }}-pd${{ matrix.floatsize }}
           path: build/${{env.LIBNAME}}
 
-  # build_windows: (disabled for now)
-  #   runs-on: windows-latest
-  #   strategy:
-  #     matrix:
-  #       os: [windows]
-  #       arch: [amd64]
-  #       floatsize: [64]
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #       with:
-  #         submodules: true
-  #     - name: Download Pure-Data Binaries
-  #       shell: pwsh
-  #       run: |
-  #         Invoke-WebRequest -Uri "https://puredata.info/downloads/pure-data/releases/${{env.PD_MAJOR}}.${{env.PD_MINOR}}-${{env.PD_BUGFIX}}-pd64/Pd64-${{env.PD_MAJOR}}.${{env.PD_MINOR}}-${{env.PD_BUGFIX}}.msw.zip" -OutFile "pd64-${{env.PD_MAJOR}}.${{env.PD_MINOR}}-${{env.PD_BUGFIX}}.msw.zip"
-  #         Expand-Archive -Path "pd64-${{env.PD_MAJOR}}.${{env.PD_MINOR}}-${{env.PD_BUGFIX}}.msw.zip" -DestinationPath .
-  #     - name: Set up MSYS2
-  #       uses: msys2/setup-msys2@v2
-  #       with:
-  #         update: true
-  #         install: >-
-  #           base-devel
-  #           mingw-w64-x86_64-toolchain
-  #           mingw-w64-x86_64-cmake
-  #     - name: Build (make deps && make install)
-  #       shell: msys2 {0}
-  #       run: |
-  #         export PATH="/mingw64/bin:$PATH"
-  #         make deps
-  #         make install CC=gcc PDINCLUDEDIR="Pd-${{env.PD_MAJOR}}.${{env.PD_MINOR}}.${{env.PD_BUGFIX}}/src" PDDIR="Pd-${{env.PD_MAJOR}}.${{env.PD_MINOR}}.${{env.PD_BUGFIX}}" PDBINDIR="Pd-${{env.PD_MAJOR}}.${{env.PD_MINOR}}.${{env.PD_BUGFIX}}/bin" PDLIBDIR=${{ env.PDLIBDIR }} floatsize=${{ matrix.floatsize }} extension=${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.floatsize }}.dll
-  #     - name: Archive artifacts
-  #       uses: actions/upload-artifact@v4
-  #       with:
-  #         name: ${{env.LIBNAME}}-${{ matrix.os }}-${{ matrix.arch }}-pd${{ matrix.floatsize }}
-  #         path: build/${{env.LIBNAME}}
+  build_windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        os: [windows]
+        arch: [amd64]
+        floatsize: [32, 64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      
+      - name: Set up MSVC
+        uses: microsoft/setup-msbuild@v2
+      
+      - name: Add MSVC to PATH
+        uses: ilammy/msvc-dev-cmd@v1
+      
+      - name: Download Pure-Data Binaries
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://puredata.info/downloads/pure-data/releases/${{env.PD_MAJOR}}.${{env.PD_MINOR}}-${{env.PD_BUGFIX}}-pd64/Pd64-${{env.PD_MAJOR}}.${{env.PD_MINOR}}-${{env.PD_BUGFIX}}.msw.zip" -OutFile "pd64-${{env.PD_MAJOR}}.${{env.PD_MINOR}}-${{env.PD_BUGFIX}}.msw.zip"
+          Expand-Archive -Path "pd64-${{env.PD_MAJOR}}.${{env.PD_MINOR}}-${{env.PD_BUGFIX}}.msw.zip" -DestinationPath .
+      
+      - name: Build SimpleBLE
+        shell: pwsh
+        run: |
+          # Clean any previous build artifacts
+          if (Test-Path SimpleBLE/simplecble/build-windows) {
+            Remove-Item -Recurse -Force SimpleBLE/simplecble/build-windows
+          }
+          
+          cd SimpleBLE/simplecble
+          
+          # Configure with Visual Studio generator (outputs generator info)
+          cmake -S . -B build-windows -G "Visual Studio 17 2022" -A x64 -DBUILD_SHARED_LIBS=OFF -DCMAKE_SYSTEM_VERSION=10.0
+          
+          # Build with MSBuild
+          cmake --build build-windows --config Release --verbose
+      
+      - name: Build Pure Data external
+        shell: pwsh
+        run: |
+          $pdDir = "Pd-${{env.PD_MAJOR}}.${{env.PD_MINOR}}.${{env.PD_BUGFIX}}"
+          $extension = if (${{ matrix.floatsize }} -eq 32) { "m_i386" } else { "${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.floatsize }}.dll" }
+          
+          # Compile source files
+          cl /nologo /DPD /DPDINSTANCE /DPD_FLOATSIZE=${{ matrix.floatsize }} `
+            /I. /I"SimpleBLE/simplecble/include" /I"SimpleBLE/simpleble/include" `
+            /I"SimpleBLE/simplecble/build-windows/simpleble/export" `
+            /I"${pdDir}/src" `
+            /O2 /W3 /LD `
+            pd-witsensor-ble.c witsensor_ble_simpleble.c `
+            /link /DLL /OUT:"${{ env.PDLIBDIR }}/witsensor/witsensor.${extension}" `
+            "SimpleBLE/simplecble/build-windows/lib/Release/simpleble.lib" `
+            "SimpleBLE/simplecble/build-windows/lib/Release/simplecble.lib" `
+            ws2_32.lib iphlpapi.lib ole32.lib setupapi.lib windowsapp.lib
+          
+          # Copy help file
+          New-Item -ItemType Directory -Force -Path "${{ env.PDLIBDIR }}/witsensor"
+          Copy-Item "witsensor-help.pd" "${{ env.PDLIBDIR }}/witsensor/"
+          Copy-Item "README.md" "${{ env.PDLIBDIR }}/witsensor/"
+      
+      - name: Archive artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{env.LIBNAME}}-${{ matrix.os }}-${{ matrix.arch }}-pd${{ matrix.floatsize }}
+          path: build/${{env.LIBNAME}}
 
   package_and_release:
     runs-on: ubuntu-latest
-    needs: [build_linux, build_macos]
+    needs: [build_linux, build_macos, build_windows]
     permissions:
       contents: write
       actions: read
