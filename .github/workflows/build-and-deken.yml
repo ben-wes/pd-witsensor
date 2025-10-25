@@ -9,7 +9,6 @@ env:
   PDINCLUDEDIR: ./pure-data/src
   PDLIBDIR: ./build
   LIBNAME: witsensor
-  LIBSLUG: witsensor
 
 jobs:
   build_linux:
