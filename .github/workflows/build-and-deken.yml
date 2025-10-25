@@ -91,19 +91,35 @@ jobs:
         if: matrix.floatsize == 32
         shell: pwsh
         run: |
+          Write-Host "Downloading Pd binaries for 32-bit float support..."
           Invoke-WebRequest -Uri "http://msp.ucsd.edu/Software/pd-${{env.PD_MAJOR}}.${{env.PD_MINOR}}-${{env.PD_BUGFIX}}.msw.zip" -OutFile "pd-${{env.PD_MAJOR}}.${{env.PD_MINOR}}-${{env.PD_BUGFIX}}.msw.zip"
           Expand-Archive -Path "pd-${{env.PD_MAJOR}}.${{env.PD_MINOR}}-${{env.PD_BUGFIX}}.msw.zip" -DestinationPath .
+          
+          # Debug: Check what we extracted
+          Write-Host "Contents after extraction:"
+          Get-ChildItem -Directory | Format-Table Name
       
       - name: Download Pure-Data Binaries (64-bit floats)
         if: matrix.floatsize == 64
         shell: pwsh
         run: |
+          Write-Host "Downloading Pd64 binaries for 64-bit float support..."
           Invoke-WebRequest -Uri "https://puredata.info/downloads/pure-data/releases/${{env.PD_MAJOR}}.${{env.PD_MINOR}}-${{env.PD_BUGFIX}}-pd64/Pd64-${{env.PD_MAJOR}}.${{env.PD_MINOR}}-${{env.PD_BUGFIX}}.msw.zip" -OutFile "pd64-${{env.PD_MAJOR}}.${{env.PD_MINOR}}-${{env.PD_BUGFIX}}.msw.zip"
           Expand-Archive -Path "pd64-${{env.PD_MAJOR}}.${{env.PD_MINOR}}-${{env.PD_BUGFIX}}.msw.zip" -DestinationPath .
+          
+          # Debug: Check what we extracted
+          Write-Host "Contents after extraction:"
+          Get-ChildItem -Directory | Format-Table Name
+          
           # Rename Pd-0.* to pd-* for consistency
           Get-ChildItem -Directory -Filter 'Pd-0.*' | ForEach-Object {
+            Write-Host "Renaming $($_.Name) to pd-${{env.PD_MAJOR}}.${{env.PD_MINOR}}-${{env.PD_BUGFIX}}"
             Rename-Item $_.FullName "pd-${{env.PD_MAJOR}}.${{env.PD_MINOR}}-${{env.PD_BUGFIX}}"
           }
+          
+          # Debug: Check final directory structure
+          Write-Host "Final directory structure:"
+          Get-ChildItem -Directory | Format-Table Name
       
       - name: Build SimpleBLE
         shell: pwsh
@@ -140,16 +156,111 @@ jobs:
           # Determine Pd library name (pd.lib for 32-bit, may need pd64.lib for 64-bit)
           $pdLib = if (${{ matrix.floatsize }} -eq 64) { "pd64.lib" } else { "pd.lib" }
           
-          # Use make like quatkram does - this properly handles float size compilation
-          Write-Host "Using make with floatsize parameter (like quatkram)..."
-          make install objectsdir=./build PDDIR=./$pdDir PDINCLUDEDIR=./$pdDir/src PDBINDIR=./$pdDir/bin floatsize=${{ matrix.floatsize }} extension=$extension
+          # Debug: Show compiler flags
+          Write-Host "Compiler flags: $pdFlags"
+          Write-Host "Pd library: $pdLib"
+          Write-Host "Float size: ${{ matrix.floatsize }}"
+          
+          # Debug: Check SimpleBLE build directory
+          Write-Host "Checking SimpleBLE build directory..."
+          Write-Host "Contents of SimpleBLE/simplecble/build-windows/lib/Release/:"
+          Get-ChildItem "SimpleBLE/simplecble/build-windows/lib/Release/" -ErrorAction SilentlyContinue | Format-Table Name
+          
+          # Debug: Check Pd directory structure
+          Write-Host "Checking Pd directory structure..."
+          Write-Host "Contents of ${pdDir}/bin/:"
+          Get-ChildItem "${pdDir}/bin/" -ErrorAction SilentlyContinue | Format-Table Name
+          Write-Host "Contents of ${pdDir}/src/:"
+          Get-ChildItem "${pdDir}/src/" -ErrorAction SilentlyContinue | Format-Table Name
+          
+          # Debug: Check if m_pd.h contains float size definitions
+          Write-Host "Checking m_pd.h for float size definitions..."
+          if (Test-Path "${pdDir}/src/m_pd.h") {
+            $mpdContent = Get-Content "${pdDir}/src/m_pd.h" -Raw
+            if ($mpdContent -match "PD_FLOATSIZE") {
+              Write-Host "Found PD_FLOATSIZE in m_pd.h"
+              $mpdContent | Select-String "PD_FLOATSIZE" | ForEach-Object { Write-Host "  $_" }
+            } else {
+              Write-Host "No PD_FLOATSIZE found in m_pd.h"
+            }
+            if ($mpdContent -match "t_float") {
+              Write-Host "Found t_float definition in m_pd.h"
+              $mpdContent | Select-String "typedef.*t_float" | ForEach-Object { Write-Host "  $_" }
+            }
+            # Check for double precision definitions
+            if ($mpdContent -match "double") {
+              Write-Host "Found 'double' in m_pd.h:"
+              $mpdContent | Select-String "double" | Select-Object -First 5 | ForEach-Object { Write-Host "  $_" }
+            }
+          }
+          
+          # Check if we need to link against static libraries instead
+          if (Test-Path "SimpleBLE/simplecble/build-windows/lib/Release/simpleble.lib") {
+            Write-Host "Found simpleble.lib - this is a static library"
+          }
+          if (Test-Path "SimpleBLE/simplecble/build-windows/lib/Release/simplecble.lib") {
+            Write-Host "Found simplecble.lib - this is also needed"
+          }
+          
+          # Debug: Test compilation with a simple float size check
+          Write-Host "Testing float size compilation..."
+          $testCode = "#include <stdio.h>`n#include `"${pdDir}/src/m_pd.h`"`nint main() {`n    printf(`"sizeof(t_float) = %d\n`", sizeof(t_float));`n    printf(`"PD_FLOATSIZE = %d\n`", PD_FLOATSIZE);`n    printf(`"sys_getfloatsize() = %d\n`", sys_getfloatsize());`n    return 0;`n}"
+          $testCode | Out-File -FilePath "test_floatsize.c" -Encoding ASCII
+          
+          # Compile and run the test
+          Write-Host "Compiling test program..."
+          cl /nologo $pdFlags /I"${pdDir}/src" test_floatsize.c /link "/LIBPATH:${pdDir}/bin" $pdLib /OUT:test_floatsize.exe
+          if (Test-Path "test_floatsize.exe") {
+            Write-Host "Running test program..."
+            $testOutput = & .\test_floatsize.exe 2>&1
+            Write-Host "Test program output: $testOutput"
+          } else {
+            Write-Host "Failed to compile test program"
+          }
+          
+          # Compile source files with MSVC
+          cl /nologo $pdFlags `
+            /I. /I"SimpleBLE/simplecble/include" /I"SimpleBLE/simpleble/include" `
+            /I"SimpleBLE/simplecble/build-windows/simpleble/export" `
+            /I"${pdDir}/src" `
+            /O2 /W3 /LD /MD `
+            pd-witsensor-ble.c witsensor_ble_simpleble.c `
+            /link /DLL "/OUT:${outFile}" `
+            "/LIBPATH:${pdDir}/bin" $pdLib `
+            "SimpleBLE/simplecble/build-windows/lib/Release/simpleble.lib" `
             "SimpleBLE/simplecble/build-windows/lib/Release/simplecble.lib" `
             ws2_32.lib iphlpapi.lib ole32.lib setupapi.lib windowsapp.lib `
             legacy_stdio_definitions.lib ucrt.lib vcruntime.lib msvcrt.lib
-          
+
           # Copy help files
           Copy-Item "witsensor-help.pd" "$outDir\"
           Copy-Item "README.md" "$outDir\"
+          
+          # Debug: Inspect the created DLL
+          Write-Host "Inspecting created DLL: $outFile"
+          if (Test-Path $outFile) {
+            Write-Host "DLL exists and is $((Get-Item $outFile).Length) bytes"
+            # Try to get DLL info using dumpbin if available
+            try {
+              $dumpbinOutput = & dumpbin /exports $outFile 2>$null
+              if ($dumpbinOutput) {
+                Write-Host "DLL exports:"
+                $dumpbinOutput | Select-String "witsensor" | ForEach-Object { Write-Host "  $_" }
+              }
+            } catch {
+              Write-Host "dumpbin not available for DLL inspection"
+            }
+          } else {
+            Write-Host "ERROR: DLL was not created!"
+          }
+          
+          # Debug: Check all files in output directory
+          Write-Host "All files in output directory:"
+          Get-ChildItem $outDir | Format-Table Name, Length
+          
+          # Debug: Check if there are any other DLLs or files that might confuse deken
+          Write-Host "Checking for any other DLL files in the entire build directory:"
+          Get-ChildItem -Recurse -Filter "*.dll" | Format-Table FullName, Length
       
       - name: Archive artifacts
         uses: actions/upload-artifact@v4
