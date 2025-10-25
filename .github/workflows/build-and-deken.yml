@@ -143,10 +143,7 @@ jobs:
           # Use make like quatkram does - this properly handles float size compilation
           Write-Host "Using make with floatsize parameter (like quatkram)..."
           make install objectsdir=./build PDDIR=./$pdDir PDINCLUDEDIR=./$pdDir/src PDBINDIR=./$pdDir/bin floatsize=${{ matrix.floatsize }} extension=$extension
-            "SimpleBLE/simplecble/build-windows/lib/Release/simplecble.lib" `
-            ws2_32.lib iphlpapi.lib ole32.lib setupapi.lib windowsapp.lib `
-            legacy_stdio_definitions.lib ucrt.lib vcruntime.lib msvcrt.lib
-          
+
           # Copy help files
           Copy-Item "witsensor-help.pd" "$outDir\"
           Copy-Item "README.md" "$outDir\"
