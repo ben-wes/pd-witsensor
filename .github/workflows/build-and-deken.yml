@@ -140,8 +140,8 @@ jobs:
           # Determine Pd library name (pd.lib for 32-bit, may need pd64.lib for 64-bit)
           $pdLib = if (${{ matrix.floatsize }} -eq 64) { "pd64.lib" } else { "pd.lib" }
           
-          # Use make like quatkram does - this properly handles float size compilation
-          Write-Host "Using make with floatsize parameter (like quatkram)..."
+          # Use make to properly handle float size compilation
+          Write-Host "Using make with floatsize parameter..."
           make install objectsdir=./build PDDIR=./$pdDir PDINCLUDEDIR=./$pdDir/src PDBINDIR=./$pdDir/bin floatsize=${{ matrix.floatsize }} extension=$extension
 
           # Copy help files

@@ -35,8 +35,8 @@ endef
 define forWindows
 	# Add Windows-specific include path for SimpleBLE
 	cflags += -I./SimpleBLE/simplecble/build-windows/simpleble/export
-	# Link against static libs built by SimpleBLE (similar to macOS)
-	ldlibs += -L./SimpleBLE/simplecble/build-windows/lib -Wl,--whole-archive,./SimpleBLE/simplecble/build-windows/lib/libsimplecble.a,./SimpleBLE/simplecble/build-windows/lib/libsimpleble.a,--no-whole-archive -lws2_32 -liphlpapi -lole32 -lsetupapi
+	# Link against MSVC-built SimpleBLE libraries
+	ldlibs += -L./SimpleBLE/simplecble/build-windows/lib/Release -lsimpleble -lws2_32 -liphlpapi -lole32 -lsetupapi
 endef
 
 # data files
