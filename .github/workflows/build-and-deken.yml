@@ -115,10 +115,10 @@ jobs:
           
           cd SimpleBLE/simplecble
           
-          # Configure with Visual Studio generator (outputs generator info)
-          cmake -S . -B build-windows -G "Visual Studio 17 2022" -A x64 -DBUILD_SHARED_LIBS=OFF
+          # Configure with MinGW generator to match Makefile's GCC compiler
+          cmake -S . -B build-windows -G "MinGW Makefiles" -DBUILD_SHARED_LIBS=OFF
           
-          # Build with MSBuild
+          # Build with make
           cmake --build build-windows --config Release --verbose
       
       - name: Build Pure Data external
