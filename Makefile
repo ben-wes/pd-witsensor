@@ -10,7 +10,7 @@ PD_PATH = /Applications/Pd-0.56-1.app/Contents/Resources/src
 PDINCLUDEDIR ?= $(PD_PATH)
 
 # source files
-witsensor.class.sources = pd-witsensor-ble.c witsensor_ble_simpleble.c macos_bt_auth.m
+witsensor.class.sources = pd-witsensor-ble.c witsensor_ble_simpleble.c
 
 # include directories (use submodule SimpleBLE C API)
 # Add export include paths for both static (macOS) and shared (Linux) builds
@@ -23,6 +23,8 @@ ldlibs = -lpthread
 define forDarwin
 	# Link against static libs built by SimpleBLE (no runtime dylib needed)
 	ldlibs += -L./SimpleBLE/simplecble/build-static/lib -Wl,-force_load,./SimpleBLE/simplecble/build-static/lib/libsimplecble.a -Wl,-force_load,./SimpleBLE/simplecble/build-static/lib/libsimpleble.a -framework CoreBluetooth -framework Foundation
+	# Include Objective-C helper for all macOS builds (needed for Bluetooth permissions)
+	witsensor.class.sources += macos_bt_auth.m
 endef
 
 define forLinux
@@ -44,6 +46,30 @@ datafiles = \
 # include pd-lib-builder
 PDLIBBUILDER_DIR=./pd-lib-builder
 include $(PDLIBBUILDER_DIR)/Makefile.pdlibbuilder
+
+# Build Objective-C helper for all architectures (place AFTER include so 'all' stays default)
+macos_bt_auth.d_amd64.o: macos_bt_auth.m
+	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -arch x86_64 -mmacosx-version-min=10.6 -c macos_bt_auth.m -o macos_bt_auth.d_amd64.o
+
+macos_bt_auth.d_arm64.o: macos_bt_auth.m
+	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -arch arm64 -mmacosx-version-min=10.6 -c macos_bt_auth.m -o macos_bt_auth.d_arm64.o
+
+# Build rules for shared library extensions
+macos_bt_auth.darwin-amd64-64.so.o: macos_bt_auth.m
+	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -arch x86_64 -mmacosx-version-min=10.6 -c macos_bt_auth.m -o macos_bt_auth.darwin-amd64-64.so.o
+
+macos_bt_auth.darwin-arm64-64.so.o: macos_bt_auth.m
+	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -arch arm64 -mmacosx-version-min=10.6 -c macos_bt_auth.m -o macos_bt_auth.darwin-arm64-64.so.o
+
+macos_bt_auth.darwin-amd64-32.so.o: macos_bt_auth.m
+	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -arch x86_64 -mmacosx-version-min=10.6 -c macos_bt_auth.m -o macos_bt_auth.darwin-amd64-32.so.o
+
+macos_bt_auth.darwin-arm64-32.so.o: macos_bt_auth.m
+	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -arch arm64 -mmacosx-version-min=10.6 -c macos_bt_auth.m -o macos_bt_auth.darwin-arm64-32.so.o
+
+# Build rule for generic pd_darwin extension (local builds)
+macos_bt_auth.pd_darwin.o: macos_bt_auth.m
+	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -mmacosx-version-min=10.6 -c macos_bt_auth.m -o macos_bt_auth.pd_darwin.o
 
 # SimpleBLE dependencies (build static for macOS and shared for Linux)
 SIMPLEBLE_DIR=SimpleBLE/simplecble
