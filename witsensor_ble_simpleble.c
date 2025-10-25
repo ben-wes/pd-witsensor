@@ -258,14 +258,14 @@ void witsensor_ble_simpleble_start_scanning(witsensor_ble_simpleble_t *ble_data)
         // Try to get adapter count first
         size_t adapter_count = simpleble_adapter_get_count();
         if (adapter_count == 0) {
-            post("WITSensorBLE: No BLE adapters found - check Bluetooth permissions in System Settings → Privacy & Security → Bluetooth");
+            pd_error(ble_data->pd_obj, "WITSensorBLE: No BLE adapters found - check Bluetooth permissions in System Settings → Privacy & Security → Bluetooth");
             return;
         }
         
         // Get the first adapter
         ble_data->adapter = simpleble_adapter_get_handle(0);
         if (!ble_data->adapter) {
-            post("WITSensorBLE: Failed to get adapter - check Bluetooth permissions in System Settings → Privacy & Security → Bluetooth");
+            pd_error(ble_data->pd_obj, "WITSensorBLE: Failed to get adapter - check Bluetooth permissions in System Settings → Privacy & Security → Bluetooth");
             return;
         }
         
@@ -274,9 +274,16 @@ void witsensor_ble_simpleble_start_scanning(witsensor_ble_simpleble_t *ble_data)
         simpleble_adapter_set_callback_on_scan_stop(ble_data->adapter, simpleble_on_scan_stop, ble_data);
         simpleble_adapter_set_callback_on_scan_found(ble_data->adapter, simpleble_on_scan_found, ble_data);
         
-        post("WITSensorBLE: BLE system initialized successfully");
+        post("WITSensorBLE: BLE adapter initialized successfully");
     }
     _clear_cached_results(ble_data);
+    
+    // Check if Bluetooth is enabled before attempting scan
+    if (!simpleble_adapter_is_bluetooth_enabled()) {
+        pd_error(ble_data->pd_obj, "WITSensorBLE: Bluetooth is not enabled - please enable Bluetooth and grant permissions");
+        return;
+    }
+    
     ble_data->is_scanning = 1;
     // Emit scanning 1 via Pd thread
     if (ble_data->pd_instance && ble_data->pd_obj) {
@@ -287,7 +294,7 @@ void witsensor_ble_simpleble_start_scanning(witsensor_ble_simpleble_t *ble_data)
     simpleble_err_t err = simpleble_adapter_scan_start(ble_data->adapter);
     if (err != SIMPLEBLE_SUCCESS) {
         ble_data->is_scanning = 0;
-        post("WITSensorBLE: scan_start failed: %d", err);
+        pd_error(ble_data->pd_obj, "WITSensorBLE: scan_start failed: %d", err);
         return;
     }
     // Continuous scanning - scan until manually stopped or connection succeeds
@@ -376,7 +383,7 @@ int witsensor_ble_simpleble_connect(witsensor_ble_simpleble_t *ble_data, const c
         }
     }
     if (!in_cached) {
-        post("WITSensorBLE: Target not in cached results; start scan to populate results before connecting");
+        pd_error(ble_data->pd_obj, "WITSensorBLE: Target not in cached results; start scan to populate results before connecting");
         return 0;
     }
 
@@ -413,7 +420,7 @@ int witsensor_ble_simpleble_connect(witsensor_ble_simpleble_t *ble_data, const c
                 if (id) simpleble_free(id);
                 return 1;
             } else {
-                post("WITSensorBLE: Failed to connect to %s", target);
+                pd_error(ble_data->pd_obj, "WITSensorBLE: Failed to connect to %s", target);
             }
         }
 
@@ -421,7 +428,7 @@ int witsensor_ble_simpleble_connect(witsensor_ble_simpleble_t *ble_data, const c
         if (id) simpleble_free(id);
     }
 
-    post("WITSensorBLE: Device not found: %s", target);
+    pd_error(ble_data->pd_obj, "WITSensorBLE: Device not found: %s", target);
     return 0;
 }
 
@@ -446,7 +453,7 @@ int witsensor_ble_simpleble_write_data(witsensor_ble_simpleble_t *ble_data, cons
     if (!ble_data || !data || length <= 0) return 0;
     
     if (!ble_data->is_connected || !ble_data->peripheral) {
-        post("WITSensorBLE: Not connected to device");
+        pd_error(ble_data->pd_obj, "WITSensorBLE: Not connected to device");
         return 0;
     }
         
@@ -459,7 +466,7 @@ int witsensor_ble_simpleble_write_data(witsensor_ble_simpleble_t *ble_data, cons
 int witsensor_ble_simpleble_write_request_raw(witsensor_ble_simpleble_t *ble_data, const unsigned char *data, int length) {
     if (!ble_data || !data || length <= 0) return 0;
     if (!ble_data->is_connected || !ble_data->peripheral) {
-        post("WITSensorBLE: Not connected to device");
+        pd_error(ble_data->pd_obj, "WITSensorBLE: Not connected to device");
         return 0;
     }
     simpleble_err_t err = simpleble_peripheral_write_request(

@@ -1019,7 +1019,7 @@ static void *witsensor_new(void) {
     x->seen_ids = NULL;
     x->seen_count = 0;
     
-    // Initialize BLE system with crash protection
+    // Initialize BLE data structure (adapter will be created on first scan)
     post("witsensor: initializing BLE system...");
     x->ble_data = witsensor_ble_simpleble_create();
     if (x->ble_data) {
@@ -1027,7 +1027,7 @@ static void *witsensor_new(void) {
         x->ble_data->pd_obj = x;
         x->ble_data->data_callback = witsensor_ble_data_callback;
         x->ble_data->pd_instance = x->pd_instance;
-        post("witsensor: BLE system initialized successfully");
+        post("witsensor: BLE data structure ready (adapter will initialize on first scan)");
     } else {
         pd_error(x, "witsensor: BLE system initialization failed");
     }
