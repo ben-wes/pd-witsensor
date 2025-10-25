@@ -140,13 +140,33 @@ jobs:
           # Determine Pd library name (pd.lib for 32-bit, may need pd64.lib for 64-bit)
           $pdLib = if (${{ matrix.floatsize }} -eq 64) { "pd64.lib" } else { "pd.lib" }
           
-          # Use make like quatkram does - this properly handles float size compilation
-          Write-Host "Using make with floatsize parameter (like quatkram)..."
-          make install objectsdir=./build PDDIR=./$pdDir PDINCLUDEDIR=./$pdDir/src PDBINDIR=./$pdDir/bin floatsize=${{ matrix.floatsize }} extension=$extension
+          # Debug: Check SimpleBLE build directory
+          Write-Host "Checking SimpleBLE build directory..."
+          Write-Host "Contents of SimpleBLE/simplecble/build-windows/lib/Release/:"
+          Get-ChildItem "SimpleBLE/simplecble/build-windows/lib/Release/" -ErrorAction SilentlyContinue | Format-Table Name
+          
+          # Check if we need to link against static libraries instead
+          if (Test-Path "SimpleBLE/simplecble/build-windows/lib/Release/simpleble.lib") {
+            Write-Host "Found simpleble.lib - this is a static library"
+          }
+          if (Test-Path "SimpleBLE/simplecble/build-windows/lib/Release/simplecble.lib") {
+            Write-Host "Found simplecble.lib - this is also needed"
+          }
+          
+          # Compile source files with MSVC
+          cl /nologo $pdFlags `
+            /I. /I"SimpleBLE/simplecble/include" /I"SimpleBLE/simpleble/include" `
+            /I"SimpleBLE/simplecble/build-windows/simpleble/export" `
+            /I"${pdDir}/src" `
+            /O2 /W3 /LD /MD `
+            pd-witsensor-ble.c witsensor_ble_simpleble.c `
+            /link /DLL "/OUT:${outFile}" `
+            "/LIBPATH:${pdDir}/bin" $pdLib `
+            "SimpleBLE/simplecble/build-windows/lib/Release/simpleble.lib" `
             "SimpleBLE/simplecble/build-windows/lib/Release/simplecble.lib" `
             ws2_32.lib iphlpapi.lib ole32.lib setupapi.lib windowsapp.lib `
             legacy_stdio_definitions.lib ucrt.lib vcruntime.lib msvcrt.lib
-          
+
           # Copy help files
           Copy-Item "witsensor-help.pd" "$outDir\"
           Copy-Item "README.md" "$outDir\"
