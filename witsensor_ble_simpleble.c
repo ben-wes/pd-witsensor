@@ -20,8 +20,9 @@
     #include <pthread.h>
 #endif
 
-// SimpleBLE includes - use simplecble headers directly
-#include <simplecble/simpleble.h>
+// SimpleBLE includes - use simplecble C API headers directly
+// Note: in newer SimpleBLE, the C API lives in simplecble/simplecble.h
+#include <simplecble/simplecble.h>
 #include "m_pd.h"
 // Pd-thread handler to announce scan completion and print cached devices
 extern void witsensor_pd_scan_complete_handler(t_pd *obj, void *data);

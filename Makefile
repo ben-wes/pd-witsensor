@@ -13,8 +13,9 @@ PDINCLUDEDIR ?= $(PD_PATH)
 witsensor.class.sources = pd-witsensor-ble.c witsensor_ble_simpleble.c
 
 # include directories (use submodule SimpleBLE C API)
-# Add export include paths for both static (macOS) and shared (Linux) builds
-cflags = -I. -I./SimpleBLE/simplecble/include -I./SimpleBLE/simpleble/include -I./SimpleBLE/simplecble/build-static/simpleble/export -I./SimpleBLE/simplecble/build/simpleble/export
+# Add export include paths for both static (macOS) and shared (Linux) builds.
+# Newer SimpleBLE generates export headers under <build>/export, not <build>/simpleble/export.
+cflags = -I. -I./SimpleBLE/simplecble/include -I./SimpleBLE/simpleble/include -I./SimpleBLE/simplecble/build-static/export -I./SimpleBLE/simplecble/build/export
 
 # libraries
 ldlibs = -lpthread
@@ -34,7 +35,7 @@ endef
 
 define forWindows
 	# Add Windows-specific include path for SimpleBLE
-	cflags += -I./SimpleBLE/simplecble/build-windows/simpleble/export
+	cflags += -I./SimpleBLE/simplecble/build-windows/export
 	# Link against MinGW-built SimpleBLE libraries
 	ldlibs += -L./SimpleBLE/simplecble/build-windows/lib -lsimpleble -lws2_32 -liphlpapi -lole32 -lsetupapi
 endef
