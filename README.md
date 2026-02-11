@@ -1,64 +1,22 @@
 ## [witsensor] Pure Data External
 
-Pure Data external for WIT BWT901 BLE sensors. macOS build uses SimpleBLE (static)
+for WitMotion BWT9011DCL-BT50 sensors
 
-### Status
-
-| Platform | Backend | Status |
-| --- | --- | --- |
-| macOS | SimpleBLE (+ small Obj‑C auth helper) | tested |
-| Linux | SimpleBLE | experimental |
-| Windows | SimpleBLE | experimental |
-
-### Clone
+### Build
 
 ```bash
-# Recommended: clone with submodules
 git clone --recurse-submodules https://github.com/ben-wes/pd-witsensor.git
 cd pd-witsensor
-
-# If you already cloned without submodules
-git submodule update --init --recursive
-```
-
-### Build (all platforms)
-
-```bash
-# Build SimpleBLE and the external
 make deps && make
 ```
 
-Note: On macOS we link SimpleBLE statically; on Linux we use the shared build tree. The same commands above handle both.
-
-#### Cross-compiling for specific architectures (macOS)
-
-```bash
-# Build for x86_64 (Intel)
-make deps arch=x86_64 && make arch=x86_64
-
-# Build for arm64 (Apple Silicon)
-make deps arch=arm64 && make arch=arm64
-
-# Build universal binary (both architectures)
-make deps arch="x86_64 arm64" && make arch="x86_64 arm64"
-```
-
-The `arch` parameter ensures SimpleBLE is built for the correct architecture(s). This is particularly important for CI/CD systems that might cross-compile on Apple Silicon runners.
-
 ### Usage (Pd)
 
-```pd
-[scan(
-[connect <name-or-mac>(
-[disconnect(
-|
+```
 [witsensor]
 ```
 
-### Project notes
-
-- Implementation: `witsensor_ble_simpleble.c` (C, SimpleBLE). Small `macos_bt_auth.m` helper for Bluetooth permission/auth prompts.
-- Build system: `Makefile` integrates SimpleBLE builds (`make deps`).
+Open help patch for extensive documentation
 
 ### License
 
