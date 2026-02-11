@@ -26,11 +26,10 @@
 #include "witsensor_ble_simpleble.h"
 
 #define WITSENSOR_MAJOR_VERSION 0
-#define WITSENSOR_MINOR_VERSION 2
-#define WITSENSOR_BUGFIX_VERSION 1
+#define WITSENSOR_MINOR_VERSION 3
+#define WITSENSOR_BUGFIX_VERSION 0
 
 #define MAX_DEVICES 20
-#define BUFFER_SIZE 256
 #define PACKET_SIZE 20
 
 // WIT sensor UUIDs
@@ -50,7 +49,6 @@ typedef struct _witsensor {
     // Data buffers
     unsigned char temp_bytes[PACKET_SIZE];
     int temp_bytes_count;
-    unsigned char data_buffer[BUFFER_SIZE];
     
     // Sensor data
     float accel_x, accel_y, accel_z;
@@ -94,6 +92,8 @@ typedef struct _witsensor {
     // Dedupe device announcements per scan
     char **seen_ids;
     unsigned long seen_count;
+    // Device RTC buffer (for parsed date/time when we have all four registers)
+    uint16_t rtc_yymm, rtc_ddh, rtc_mmss;
     
 } t_witsensor;
 
@@ -117,6 +117,7 @@ static void witsensor_save(t_witsensor *x);
 static void witsensor_restore(t_witsensor *x);
 static void witsensor_read_version(t_witsensor *x);
 static void witsensor_read_time(t_witsensor *x);
+static void witsensor_settime(t_witsensor *x, t_symbol *s, int argc, t_atom *argv);
 static void witsensor_reset(t_witsensor *x);
 static void witsensor_setname(t_witsensor *x, t_symbol *s, int argc, t_atom *argv);
 // pd_queue_mess marshaling
@@ -125,8 +126,12 @@ typedef struct _queued_output {
     int argc; 
     t_atom argv[4]; 
 } t_queued_output;
+typedef struct _queued_datetime {
+    int year, month, day, hour, min, sec, ms;
+} t_queued_datetime;
 
 static void witsensor_pd_output_handler(t_pd *obj, void *data);
+static void witsensor_pd_datetime_handler(t_pd *obj, void *data);
 static void witsensor_ble_data_callback(void *user_data, unsigned char *data, int length);
 void witsensor_pd_scan_complete_handler(t_pd *obj, void *data);
 // New Pd-thread handlers for status output
@@ -140,27 +145,51 @@ void witsensor_pd_connected_handler(t_pd *obj, void *data);
 static void witsensor_ble_data_callback(void *user_data, unsigned char *data, int length) {
     t_witsensor *x = (t_witsensor *)user_data;
     if (!x) return;
-    if (length <= 0 || length > 64) return;
-    
-    // Process any register read response (0x71) immediately to avoid queue flooding
-    if (data[0] == 0x55 && data[1] == 0x71 && length >= 6) {
-        witsensor_process_register_response(x, data, length);
-        return;
-    }
-    
-    // Process streaming data (0x61) - parse on BLE thread, queue for Pd thread
-    if (data[0] == 0x55 && data[1] == 0x61 && length >= 20) {
-        witsensor_process_streaming_data(x, data, length);
-        // Queue the output for immediate Pd thread processing
-        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
-        if (out) {
-            out->msg = gensym("streaming");
-            out->argc = 0;
-            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+    if (length <= 0) return;
+
+    // Parse as a byte stream so we handle partial packets and coalesced notifications.
+    for (int i = 0; i < length; i++) {
+        unsigned char b = data[i];
+
+        if (x->temp_bytes_count == 0) {
+            if (b == 0x55) {
+                x->temp_bytes[0] = b;
+                x->temp_bytes_count = 1;
+            }
+            continue;
         }
-        return;
+
+        if (x->temp_bytes_count == 1) {
+            if (b == 0x61 || b == 0x71) {
+                x->temp_bytes[1] = b;
+                x->temp_bytes_count = 2;
+            } else if (b == 0x55) {
+                x->temp_bytes[0] = 0x55;
+                x->temp_bytes_count = 1;
+            } else {
+                x->temp_bytes_count = 0;
+            }
+            continue;
+        }
+
+        x->temp_bytes[x->temp_bytes_count++] = b;
+        if (x->temp_bytes_count < PACKET_SIZE) continue;
+
+        if (x->temp_bytes[1] == 0x71) {
+            witsensor_process_register_response(x, x->temp_bytes, PACKET_SIZE);
+        } else if (x->temp_bytes[1] == 0x61) {
+            witsensor_process_streaming_data(x, x->temp_bytes, PACKET_SIZE);
+            // Queue the output for immediate Pd thread processing
+            t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
+            if (out) {
+                out->msg = gensym("streaming");
+                out->argc = 0;
+                pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+            }
+        }
+
+        x->temp_bytes_count = 0;
     }
-    return;
 }
 
 // Process register read responses immediately on BLE thread (thread-safe for register reads)
@@ -274,47 +303,37 @@ static void witsensor_process_register_response(t_witsensor *x, unsigned char *d
         }
         return;
     }
+    /* Device RTC: 0x30 YYMM, 0x31 DDHH, 0x32 MMSS, 0x33 MS. Per WIT protocol: YYMM = month[15:8] year[7:0], DDHH = hour[15:8] day[7:0], MMSS = sec[15:8] min[7:0]. */
     if (start == 0x30 && length >= 6) {
-        uint16_t yymm = (uint16_t)(data[4] | (data[5] << 8));
-        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
-        if (out) {
-            out->msg = gensym("time_yymm");
-            out->argc = 1;
-            SETFLOAT(&out->argv[0], (t_float)yymm);
-            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
-        }
+        x->rtc_yymm = (uint16_t)(data[4] | (data[5] << 8));
         return;
     }
     if (start == 0x31 && length >= 6) {
-        uint16_t ddh = (uint16_t)(data[4] | (data[5] << 8));
-        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
-        if (out) {
-            out->msg = gensym("time_ddh");
-            out->argc = 1;
-            SETFLOAT(&out->argv[0], (t_float)ddh);
-            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
-        }
+        x->rtc_ddh = (uint16_t)(data[4] | (data[5] << 8));
         return;
     }
     if (start == 0x32 && length >= 6) {
-        uint16_t mmss = (uint16_t)(data[4] | (data[5] << 8));
-        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
-        if (out) {
-            out->msg = gensym("time_mmss");
-            out->argc = 1;
-            SETFLOAT(&out->argv[0], (t_float)mmss);
-            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
-        }
+        x->rtc_mmss = (uint16_t)(data[4] | (data[5] << 8));
         return;
     }
     if (start == 0x33 && length >= 6) {
         uint16_t ms = (uint16_t)(data[4] | (data[5] << 8));
-        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
-        if (out) {
-            out->msg = gensym("time_ms");
-            out->argc = 1;
-            SETFLOAT(&out->argv[0], (t_float)ms);
-            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+        int year = 2000 + (int)(x->rtc_yymm & 0xFF);
+        int month = (int)((x->rtc_yymm >> 8) & 0xFF);
+        int day = (int)(x->rtc_ddh & 0xFF);
+        int hour = (int)((x->rtc_ddh >> 8) & 0xFF);
+        int min = (int)(x->rtc_mmss & 0xFF);
+        int sec = (int)((x->rtc_mmss >> 8) & 0xFF);
+        t_queued_datetime *dt = (t_queued_datetime *)malloc(sizeof(t_queued_datetime));
+        if (dt) {
+            dt->year = year;
+            dt->month = month;
+            dt->day = day;
+            dt->hour = hour;
+            dt->min = min;
+            dt->sec = sec;
+            dt->ms = (int)ms;
+            pd_queue_mess(x->pd_instance, (t_pd *)x, dt, witsensor_pd_datetime_handler);
         }
         return;
     }
@@ -576,17 +595,26 @@ static void witsensor_pd_output_handler(t_pd *obj, void *data) {
         outlet_anything(x->status_out, out->msg, out->argc, out->argv);
     } else if (out->msg == gensym("version2")) {
         outlet_anything(x->status_out, out->msg, out->argc, out->argv);
-    } else if (out->msg == gensym("time_yymm")) {
-        outlet_anything(x->status_out, out->msg, out->argc, out->argv);
-    } else if (out->msg == gensym("time_ddh")) {
-        outlet_anything(x->status_out, out->msg, out->argc, out->argv);
-    } else if (out->msg == gensym("time_mmss")) {
-        outlet_anything(x->status_out, out->msg, out->argc, out->argv);
-    } else if (out->msg == gensym("time_ms")) {
-        outlet_anything(x->status_out, out->msg, out->argc, out->argv);
     }
     
     free(out);
+}
+
+// Handle parsed RTC date/time on Pd scheduler thread: one "time" message (yyyy mm dd hh mm ss ms)
+static void witsensor_pd_datetime_handler(t_pd *obj, void *data) {
+    if (!obj || !data) return;
+    t_witsensor *x = (t_witsensor *)obj;
+    t_queued_datetime *dt = (t_queued_datetime *)data;
+    t_atom a[7];
+    SETFLOAT(&a[0], (t_float)dt->year);
+    SETFLOAT(&a[1], (t_float)dt->month);
+    SETFLOAT(&a[2], (t_float)dt->day);
+    SETFLOAT(&a[3], (t_float)dt->hour);
+    SETFLOAT(&a[4], (t_float)dt->min);
+    SETFLOAT(&a[5], (t_float)dt->sec);
+    SETFLOAT(&a[6], (t_float)dt->ms);
+    outlet_anything(x->status_out, gensym("time"), 7, a);
+    free(dt);
 }
 
 // Handle connection status changes on Pd scheduler thread
@@ -866,6 +894,65 @@ static void witsensor_read_time(t_witsensor *x) {
     witsensor_ble_simpleble_write_data(x->ble_data, c33, sizeof(c33));
 }
 
+// Set device RTC: settime year month day hour min sec [ms]. Unlock, write 0x30-0x33, save.
+static void witsensor_settime(t_witsensor *x, t_symbol *s, int argc, t_atom *argv) {
+    (void)s;
+    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    if (argc < 6) {
+        post("witsensor: settime year month day hour min sec [ms]");
+        return;
+    }
+    int year = (int)atom_getfloat(argv + 0);
+    int month = (int)atom_getfloat(argv + 1);
+    int day = (int)atom_getfloat(argv + 2);
+    int hour = (int)atom_getfloat(argv + 3);
+    int min = (int)atom_getfloat(argv + 4);
+    int sec = (int)atom_getfloat(argv + 5);
+    int ms = (argc >= 7) ? (int)atom_getfloat(argv + 6) : 0;
+    if (year < 2000 || year > 2099) {
+        post("witsensor: settime year must be 2000–2099 (device RTC does not support 19xx)");
+        return;
+    }
+    if (month < 1) month = 1; if (month > 12) month = 12;
+    if (day < 1) day = 1; if (day > 31) day = 31;
+    if (hour < 0) hour = 0; if (hour > 23) hour = 23;
+    if (min < 0) min = 0; if (min > 59) min = 59;
+    if (sec < 0) sec = 0; if (sec > 59) sec = 59;
+    if (ms < 0) ms = 0; if (ms > 999) ms = 999;
+    int yy = year >= 2000 ? (year - 2000) : (year % 100);
+    if (yy < 0) yy = 0; if (yy > 99) yy = 99;
+    uint16_t yymm = (uint16_t)((month << 8) | (yy & 0xFF));
+    uint16_t ddh = (uint16_t)((hour << 8) | (day & 0xFF));
+    uint16_t mmss = (uint16_t)((sec << 8) | (min & 0xFF));
+    unsigned char unlock[] = {0xFF, 0xAA, 0x69, 0x88, 0xB5};
+    witsensor_ble_simpleble_write_data(x->ble_data, unlock, sizeof(unlock));
+    usleep(50000);
+    unsigned char w30[] = {0xFF, 0xAA, 0x30, (unsigned char)(yymm & 0xFF), (unsigned char)(yymm >> 8)};
+    unsigned char w31[] = {0xFF, 0xAA, 0x31, (unsigned char)(ddh & 0xFF), (unsigned char)(ddh >> 8)};
+    unsigned char w32[] = {0xFF, 0xAA, 0x32, (unsigned char)(mmss & 0xFF), (unsigned char)(mmss >> 8)};
+    unsigned char w33[] = {0xFF, 0xAA, 0x33, (unsigned char)(ms & 0xFF), (unsigned char)(ms >> 8)};
+    witsensor_ble_simpleble_write_data(x->ble_data, w30, sizeof(w30));
+    usleep(20000);
+    witsensor_ble_simpleble_write_data(x->ble_data, w31, sizeof(w31));
+    usleep(20000);
+    witsensor_ble_simpleble_write_data(x->ble_data, w32, sizeof(w32));
+    usleep(20000);
+    witsensor_ble_simpleble_write_data(x->ble_data, w33, sizeof(w33));
+    usleep(20000);
+    unsigned char save[] = {0xFF, 0xAA, 0x00, 0x00, 0x00};
+    witsensor_ble_simpleble_write_data(x->ble_data, save, sizeof(save));
+    post("witsensor: RTC set to %04d-%02d-%02d %02d:%02d:%02d.%03d", year, month, day, hour, min, sec, ms);
+    t_atom a[7];
+    SETFLOAT(&a[0], (t_float)year);
+    SETFLOAT(&a[1], (t_float)month);
+    SETFLOAT(&a[2], (t_float)day);
+    SETFLOAT(&a[3], (t_float)hour);
+    SETFLOAT(&a[4], (t_float)min);
+    SETFLOAT(&a[5], (t_float)sec);
+    SETFLOAT(&a[6], (t_float)ms);
+    outlet_anything(x->status_out, gensym("time"), 7, a);
+}
+
 // Clear cached scan results (Pd message: reset)
 static void witsensor_reset(t_witsensor *x) {
     if (!x || !x->ble_data) { post("witsensor: BLE not initialized"); return; }
@@ -1018,6 +1105,9 @@ static void *witsensor_new(void) {
     x->pending_target = NULL;
     x->seen_ids = NULL;
     x->seen_count = 0;
+    x->rtc_yymm = 0;
+    x->rtc_ddh = 0;
+    x->rtc_mmss = 0;
     
     // Initialize BLE data structure (adapter will be created on first scan)
     post("witsensor: initializing BLE system...");
@@ -1171,6 +1261,7 @@ void witsensor_setup(void) {
     // Device queries
     class_addmethod(witsensor_class, (t_method)witsensor_read_version, gensym("version"), 0);
     class_addmethod(witsensor_class, (t_method)witsensor_read_time, gensym("time"), 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_settime, gensym("settime"), A_GIMME, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_battery, gensym("battery"), 0);
     class_addmethod(witsensor_class, (t_method)witsensor_temp, gensym("temp"), 0);
     class_addmethod(witsensor_class, (t_method)witsensor_mag, gensym("mag"), 0);
@@ -1186,77 +1277,42 @@ void witsensor_setup(void) {
     witsensor_version();
 }
 
-// Set Bluetooth name via vendor ASCII command with selectable variant
-// Usage: setname <editable_part> [variant]
-//   variant 1: "WT %s \r\n" (space before and after name, CRLF) [default per docs]
-//   variant 2: "WT %s\r\n"  (space, CRLF)
-//   variant 3: "WT%s\r\n"   (no space, CRLF)
+// Set Bluetooth name via vendor ASCII command: "WT<name>\r\n". We prepend "WT" and strip
+// a leading "WT" from input so "MySensor" or "WTMySensor" both become "WTMySensor".
+// Usage: setname <name>  (max 14 chars after "WT", spaces stripped)
 static void witsensor_setname(t_witsensor *x, t_symbol *s, int argc, t_atom *argv) {
     (void)s;
     if (!x || !x->ble_data || !x->is_connected) { post("witsensor: not connected to device"); return; }
-    if (argc < 1 || argv[0].a_type != A_SYMBOL) { post("witsensor: setname requires a symbol argument"); return; }
-    const char *input = argv[0].a_w.w_symbol ? argv[0].a_w.w_symbol->s_name : NULL;
-    if (!input || !input[0]) { post("witsensor: setname requires non-empty name"); return; }
-    
-    int variant = 1;
-    if (argc >= 2 && argv[1].a_type == A_FLOAT) {
-        int v = (int)atom_getfloat(&argv[1]);
-        if (v >= 1 && v <= 3) variant = v;
-    }
+    const char *input = "";
+    if (argc >= 1 && argv[0].a_type == A_SYMBOL && argv[0].a_w.w_symbol &&
+        argv[0].a_w.w_symbol->s_name)
+        input = argv[0].a_w.w_symbol->s_name;
 
-    // Build full name: 'WT' + up to 14 non-space chars from editable; strip leading 'WT'
     const char *editable = input;
     if (editable[0] == 'W' && editable[1] == 'T') editable += 2;
     char full_name[20];
     size_t fn = 0;
     full_name[fn++] = 'W';
     full_name[fn++] = 'T';
-    size_t editable_nonspace = 0;
     for (size_t i = 0; editable[i] != '\0' && fn < 16; i++) {
         char c = editable[i];
         if (c == ' ' || c == '\t' || c == '\n' || c == '\r') continue;
-        editable_nonspace++;
         full_name[fn++] = c;
     }
     full_name[fn] = '\0';
-    if (editable_nonspace > 14) {
-        post("witsensor: setname truncated to 14 chars: %s", full_name);
-    }
-    
-    post("witsensor: setname starting - variant %d, name: %s", variant, full_name);
-    
-    // Unlock
+
+    post("witsensor: setting device name to %s", full_name);
+
     unsigned char unlock[] = {0xFF, 0xAA, 0x69, 0x88, 0xB5};
     witsensor_ble_simpleble_write_data(x->ble_data, unlock, sizeof(unlock));
-    usleep(100000);  // Increased delay
-    
-    // Build ASCII command per variant
+    usleep(100000);
+
     char cmd[64];
-    int n = 0;
-    if (variant == 1) {
-        n = snprintf(cmd, sizeof(cmd), "WT %s \r\n", full_name);
-    } else if (variant == 2) {
-        n = snprintf(cmd, sizeof(cmd), "WT %s\r\n", full_name);
-    } else {
-        n = snprintf(cmd, sizeof(cmd), "WT%s\r\n", full_name);
-    }
-    
+    int n = snprintf(cmd, sizeof(cmd), "WT%s\r\n", full_name);
     if (n > 0) {
-        // Debug: print the exact bytes being sent
-        post("witsensor: sending ASCII command: '%s' (length: %d)", cmd, n);
-        for (int i = 0; i < n; i++) {
-            post("  byte[%d] = 0x%02X ('%c')", i, (unsigned char)cmd[i], (cmd[i] >= 32 && cmd[i] <= 126) ? cmd[i] : '.');
-        }
-        
-        // Use write-request to ensure correct length and delivery semantics
         witsensor_ble_simpleble_write_request_raw(x->ble_data, (const unsigned char*)cmd, n);
-        
-        // Send save immediately - no delay to avoid device timeout/reboot
-        usleep(10000);  // Minimal delay
-        post("witsensor: sending save command immediately");
+        usleep(10000);
         unsigned char save[] = {0xFF, 0xAA, 0x00, 0x00, 0x00};
         witsensor_ble_simpleble_write_data(x->ble_data, save, sizeof(save));
     }
-    
-    post("witsensor: setname complete - expect disconnect/reboot");
 }

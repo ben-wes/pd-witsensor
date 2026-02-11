@@ -166,12 +166,9 @@ static void simpleble_on_data_received(simpleble_peripheral_t peripheral, simple
     (void)peripheral; (void)service; (void)characteristic;
     witsensor_ble_simpleble_t *ble_data = (witsensor_ble_simpleble_t *)user_data;
     if (!ble_data) return;
-    // Pass-through: forward raw frame to Pd layer for parsing
+    // Pass-through: forward full notification payload to Pd layer for stream parsing.
     if (ble_data->data_callback && data && length > 0) {
-        size_t n = length > 64 ? 64 : length;
-        unsigned char buf[64];
-        memcpy(buf, data, n);
-        ble_data->data_callback(ble_data->pd_obj, buf, (int)n);
+        ble_data->data_callback(ble_data->pd_obj, (unsigned char *)data, (int)length);
     }
     ble_data->data_count++;
     ble_data->last_data_time = time(NULL);
