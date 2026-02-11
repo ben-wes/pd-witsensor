@@ -1249,7 +1249,7 @@ static void witsensor_zzero(t_witsensor *x) {
 
 // Version info
 static void witsensor_version(void) {
-    post("witsensor v%d.%d.%d - WIT BWT901BLE5.0 sensor external for PureData", 
+    post("witsensor v%d.%d.%d - WitMotion WT9011DCL-BT50 sensor external", 
          WITSENSOR_MAJOR_VERSION, WITSENSOR_MINOR_VERSION, WITSENSOR_BUGFIX_VERSION);
 }
 

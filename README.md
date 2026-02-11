@@ -1,6 +1,6 @@
 ## [witsensor] Pure Data External
 
-for WitMotion BWT9011DCL-BT50 sensors
+for WitMotion WT9011DCL-BT50 sensor
 
 ### Build
 
