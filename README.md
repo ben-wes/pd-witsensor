@@ -8,7 +8,7 @@ Pure Data external for WIT BWT901 BLE sensors. macOS build uses SimpleBLE (stati
 | --- | --- | --- |
 | macOS | SimpleBLE (+ small Obj‑C auth helper) | tested |
 | Linux | SimpleBLE | experimental |
-| Windows | SimpleBLE | not yet available |
+| Windows | SimpleBLE | experimental |
 
 ### Clone
 
