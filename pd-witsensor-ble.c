@@ -106,7 +106,6 @@ static void witsensor_connect(t_witsensor *x, t_symbol *s, int argc, t_atom *arg
 static void witsensor_disconnect(t_witsensor *x);
 static void witsensor_process_register_response(t_witsensor *x, unsigned char *data, int length);
 static void witsensor_process_streaming_data(t_witsensor *x, unsigned char *data, int length);
-static void witsensor_send_sensor_data(t_witsensor *x);
 static void witsensor_send_quaternion_data(t_witsensor *x);
 static void witsensor_poll_tick(t_witsensor *x);
 static void witsensor_battery(t_witsensor *x);
@@ -129,8 +128,20 @@ typedef struct _queued_output {
 typedef struct _queued_datetime {
     int year, month, day, hour, min, sec, ms;
 } t_queued_datetime;
+/* Snapshot of streaming values per packet; avoids overwriting x before Pd handler runs */
+typedef struct _queued_streaming {
+    float accel_x, accel_y, accel_z;
+    float gyro_x, gyro_y, gyro_z;
+    float disp_x, disp_y, disp_z;
+    float speed_x, speed_y, speed_z;
+    unsigned short ts_lo, ts_hi;
+    float angle_x, angle_y, angle_z;
+    int use_disp_speed;
+    int use_timestamp;
+} t_queued_streaming;
 
 static void witsensor_pd_output_handler(t_pd *obj, void *data);
+static void witsensor_pd_streaming_handler(t_pd *obj, void *data);
 static void witsensor_pd_datetime_handler(t_pd *obj, void *data);
 static void witsensor_ble_data_callback(void *user_data, unsigned char *data, int length);
 void witsensor_pd_scan_complete_handler(t_pd *obj, void *data);
@@ -179,12 +190,17 @@ static void witsensor_ble_data_callback(void *user_data, unsigned char *data, in
             witsensor_process_register_response(x, x->temp_bytes, PACKET_SIZE);
         } else if (x->temp_bytes[1] == 0x61) {
             witsensor_process_streaming_data(x, x->temp_bytes, PACKET_SIZE);
-            // Queue the output for immediate Pd thread processing
-            t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
-            if (out) {
-                out->msg = gensym("streaming");
-                out->argc = 0;
-                pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+            t_queued_streaming *snap = (t_queued_streaming *)malloc(sizeof(t_queued_streaming));
+            if (snap) {
+                snap->accel_x = x->accel_x; snap->accel_y = x->accel_y; snap->accel_z = x->accel_z;
+                snap->gyro_x = x->gyro_x; snap->gyro_y = x->gyro_y; snap->gyro_z = x->gyro_z;
+                snap->disp_x = x->disp_x; snap->disp_y = x->disp_y; snap->disp_z = x->disp_z;
+                snap->speed_x = x->speed_x; snap->speed_y = x->speed_y; snap->speed_z = x->speed_z;
+                snap->ts_lo = x->ts_lo; snap->ts_hi = x->ts_hi;
+                snap->angle_x = x->angle_x; snap->angle_y = x->angle_y; snap->angle_z = x->angle_z;
+                snap->use_disp_speed = x->use_disp_speed;
+                snap->use_timestamp = x->use_timestamp;
+                pd_queue_mess(x->pd_instance, (t_pd *)x, snap, witsensor_pd_streaming_handler);
             }
         }
 
@@ -503,42 +519,51 @@ static void witsensor_send_quaternion_data(t_witsensor *x) {
     outlet_anything(x->data_out, gensym("quat"), 4, args);
 }
 
-// Send sensor data as PureData messages
-static void witsensor_send_sensor_data(t_witsensor *x) {
+/* Send sensor data from a queued snapshot (avoids duplicate outputs when BLE delivers many packets) */
+static void witsensor_send_sensor_data_from_snapshot(t_witsensor *x, const t_queued_streaming *snap) {
     t_atom args[3];
-    if (x->use_disp_speed) {
-        SETFLOAT(&args[0], x->disp_x);
-        SETFLOAT(&args[1], x->disp_y);
-        SETFLOAT(&args[2], x->disp_z);
+    if (snap->use_disp_speed) {
+        SETFLOAT(&args[0], snap->disp_x);
+        SETFLOAT(&args[1], snap->disp_y);
+        SETFLOAT(&args[2], snap->disp_z);
         outlet_anything(x->data_out, gensym("disp"), 3, args);
-        SETFLOAT(&args[0], x->speed_x);
-        SETFLOAT(&args[1], x->speed_y);
-        SETFLOAT(&args[2], x->speed_z);
+        SETFLOAT(&args[0], snap->speed_x);
+        SETFLOAT(&args[1], snap->speed_y);
+        SETFLOAT(&args[2], snap->speed_z);
         outlet_anything(x->data_out, gensym("speed"), 3, args);
     } else {
-        SETFLOAT(&args[0], x->accel_x);
-        SETFLOAT(&args[1], x->accel_y);
-        SETFLOAT(&args[2], x->accel_z);
+        SETFLOAT(&args[0], snap->accel_x);
+        SETFLOAT(&args[1], snap->accel_y);
+        SETFLOAT(&args[2], snap->accel_z);
         outlet_anything(x->data_out, gensym("accel"), 3, args);
-        SETFLOAT(&args[0], x->gyro_x);
-        SETFLOAT(&args[1], x->gyro_y);
-        SETFLOAT(&args[2], x->gyro_z);
+        SETFLOAT(&args[0], snap->gyro_x);
+        SETFLOAT(&args[1], snap->gyro_y);
+        SETFLOAT(&args[2], snap->gyro_z);
         outlet_anything(x->data_out, gensym("gyro"), 3, args);
     }
-    if (x->use_timestamp) {
-        SETFLOAT(&args[0], (t_float)x->ts_hi);
-        SETFLOAT(&args[1], (t_float)x->ts_lo);
+    if (snap->use_timestamp) {
+        SETFLOAT(&args[0], (t_float)snap->ts_hi);
+        SETFLOAT(&args[1], (t_float)snap->ts_lo);
         outlet_anything(x->data_out, gensym("timestamp"), 2, args);
         SETFLOAT(&args[0], 0);
         SETFLOAT(&args[1], 0);
-        SETFLOAT(&args[2], x->angle_z);
+        SETFLOAT(&args[2], snap->angle_z);
         outlet_anything(x->data_out, gensym("angle"), 3, args);
     } else {
-        SETFLOAT(&args[0], x->angle_x);
-        SETFLOAT(&args[1], x->angle_y);
-        SETFLOAT(&args[2], x->angle_z);
+        SETFLOAT(&args[0], snap->angle_x);
+        SETFLOAT(&args[1], snap->angle_y);
+        SETFLOAT(&args[2], snap->angle_z);
         outlet_anything(x->data_out, gensym("angle"), 3, args);
     }
+}
+
+// Handle queued streaming snapshots on Pd scheduler thread
+static void witsensor_pd_streaming_handler(t_pd *obj, void *data) {
+    if (!obj || !data) return;
+    t_witsensor *x = (t_witsensor *)obj;
+    t_queued_streaming *snap = (t_queued_streaming *)data;
+    witsensor_send_sensor_data_from_snapshot(x, snap);
+    free(snap);
 }
 
 // Function for polling requests (battery/temp/mag/quat)
@@ -589,8 +614,6 @@ static void witsensor_pd_output_handler(t_pd *obj, void *data) {
         outlet_anything(x->data_out, out->msg, out->argc, out->argv);
     } else if (out->msg == gensym("quat")) {
         witsensor_send_quaternion_data(x);
-    } else if (out->msg == gensym("streaming")) {
-        witsensor_send_sensor_data(x);
     } else if (out->msg == gensym("version1")) {
         outlet_anything(x->status_out, out->msg, out->argc, out->argv);
     } else if (out->msg == gensym("version2")) {
@@ -824,7 +847,8 @@ static void witsensor_set_bandwidth(t_witsensor *x, t_float hz) {
     unsigned char cmd_bw[] = {0xFF, 0xAA, 0x1F, bw_code, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_bw, sizeof(cmd_bw));
     
-    t_atom a; SETFLOAT(&a, hz);
+    static const float bw_hz[] = { 256.0f, 188.0f, 98.0f, 42.0f, 20.0f, 10.0f, 5.0f };
+    t_atom a; SETFLOAT(&a, (t_float)bw_hz[bw_code]);
     outlet_anything(x->status_out, gensym("bandwidth"), 1, &a);
 }
 
