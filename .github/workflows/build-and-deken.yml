@@ -221,7 +221,7 @@ jobs:
           # Compile source files with MSVC
           cl /nologo $pdFlags `
             /I. /I"SimpleBLE/simplecble/include" /I"SimpleBLE/simpleble/include" `
-            /I"SimpleBLE/simplecble/build-windows/simpleble/export" `
+            /I"SimpleBLE/simplecble/build-windows/export" `
             /I"${pdDir}/src" `
             /O2 /W3 /LD /MD `
             /DPD_FLOATSIZE=${{ matrix.floatsize }} `
