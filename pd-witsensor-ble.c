@@ -80,6 +80,7 @@ typedef struct _witsensor {
     // Tracked sensor state
     int axis_mode;       // 6 or 9
     int output_mode;     // AGPVSEL 0..3
+    int stream_compact;  // 0 = separate disp/speed/accel/gyro/timestamp/angle; 1 = one list
     
     // BLE specific
     witsensor_ble_simpleble_t *ble_data;
@@ -115,9 +116,20 @@ static void witsensor_save(t_witsensor *x);
 static void witsensor_restore(t_witsensor *x);
 static void witsensor_read_version(t_witsensor *x);
 static void witsensor_read_time(t_witsensor *x);
+static void witsensor_read_rate(t_witsensor *x);
+static void witsensor_read_bandwidth(t_witsensor *x);
+static void witsensor_read_axis(t_witsensor *x);
+static void witsensor_read_outputmode(t_witsensor *x);
+static void witsensor_read_orientation(t_witsensor *x);
+static void witsensor_read_baud(t_witsensor *x);
 static void witsensor_settime(t_witsensor *x, t_symbol *s, int argc, t_atom *argv);
 static void witsensor_reset(t_witsensor *x);
 static void witsensor_setname(t_witsensor *x, t_symbol *s, int argc, t_atom *argv);
+static void witsensor_set_rate(t_witsensor *x, t_float rate);
+static void witsensor_set_bandwidth(t_witsensor *x, t_float hz);
+static void witsensor_axis(t_witsensor *x, t_float axis_count);
+static void witsensor_set_output_mode(t_witsensor *x, t_floatarg mode);
+static int witsensor_ensure_connected(t_witsensor *x);
 // pd_queue_mess marshaling
 typedef struct _queued_output { 
     t_symbol *msg; 
@@ -369,6 +381,28 @@ static void witsensor_process_register_response(t_witsensor *x, unsigned char *d
         }
         return;
     }
+    if (start == 0x23 && length >= 6) {
+        unsigned char orient = (unsigned char)data[4];
+        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
+        if (out) {
+            out->msg = gensym("orientation");
+            out->argc = 1;
+            SETFLOAT(&out->argv[0], (t_float)(orient & 1));
+            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+        }
+        return;
+    }
+    if (start == 0x04 && length >= 6) {
+        unsigned char baud_code = (unsigned char)data[4];
+        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
+        if (out) {
+            out->msg = gensym("baud");
+            out->argc = 1;
+            SETFLOAT(&out->argv[0], (t_float)baud_code);
+            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+        }
+        return;
+    }
     /* Device RTC: 0x30 YYMM, 0x31 DDHH, 0x32 MMSS, 0x33 MS. Per WIT protocol: YYMM = month[15:8] year[7:0], DDHH = hour[15:8] day[7:0], MMSS = sec[15:8] min[7:0]. */
     if (start == 0x30 && length >= 6) {
         x->rtc_yymm = (uint16_t)(data[4] | (data[5] << 8));
@@ -569,8 +603,31 @@ static void witsensor_send_quaternion_data(t_witsensor *x) {
     outlet_anything(x->data_out, gensym("quat"), 4, args);
 }
 
-/* Send sensor data from a queued snapshot (avoids duplicate outputs when BLE delivers many packets) */
+/* Send sensor data from a queued snapshot. If stream_compact: one list (17 floats). Else: separate messages. */
 static void witsensor_send_sensor_data_from_snapshot(t_witsensor *x, const t_queued_streaming *snap) {
+    if (x->stream_compact) {
+        /* Fixed order: disp_xyz, speed_xyz, accel_xyz, gyro_xyz, ts_hi, ts_lo, angle_xyz (17 floats) */
+        t_atom a[17];
+        SETFLOAT(&a[0], snap->disp_x);
+        SETFLOAT(&a[1], snap->disp_y);
+        SETFLOAT(&a[2], snap->disp_z);
+        SETFLOAT(&a[3], snap->speed_x);
+        SETFLOAT(&a[4], snap->speed_y);
+        SETFLOAT(&a[5], snap->speed_z);
+        SETFLOAT(&a[6], snap->accel_x);
+        SETFLOAT(&a[7], snap->accel_y);
+        SETFLOAT(&a[8], snap->accel_z);
+        SETFLOAT(&a[9], snap->gyro_x);
+        SETFLOAT(&a[10], snap->gyro_y);
+        SETFLOAT(&a[11], snap->gyro_z);
+        SETFLOAT(&a[12], (t_float)snap->ts_hi);
+        SETFLOAT(&a[13], (t_float)snap->ts_lo);
+        SETFLOAT(&a[14], snap->angle_x);
+        SETFLOAT(&a[15], snap->angle_y);
+        SETFLOAT(&a[16], snap->angle_z);
+        outlet_anything(x->data_out, gensym("list"), 17, a);
+        return;
+    }
     t_atom args[3];
     if (snap->use_disp_speed) {
         SETFLOAT(&args[0], snap->disp_x);
@@ -820,14 +877,10 @@ static void witsensor_connect(t_witsensor *x, t_symbol *s, int argc, t_atom *arg
             outlet_anything(x->status_out, gensym("bandwidth"), 1, &bw);
             x->poll_interval = 0;
             // Query current state so status reflects device registers (rate, bandwidth, axis, outputmode)
-            unsigned char q_rate[] = {0xFF, 0xAA, 0x27, 0x03, 0x00};
-            unsigned char q_bw[] = {0xFF, 0xAA, 0x27, 0x1F, 0x00};
-            unsigned char q_axis[] = {0xFF, 0xAA, 0x27, 0x24, 0x00};
-            unsigned char q_outmode[] = {0xFF, 0xAA, 0x27, 0x96, 0x00};
-            witsensor_ble_simpleble_write_data(x->ble_data, q_rate, sizeof(q_rate));
-            witsensor_ble_simpleble_write_data(x->ble_data, q_bw, sizeof(q_bw));
-            witsensor_ble_simpleble_write_data(x->ble_data, q_axis, sizeof(q_axis));
-            witsensor_ble_simpleble_write_data(x->ble_data, q_outmode, sizeof(q_outmode));
+            witsensor_read_rate(x);
+            witsensor_read_bandwidth(x);
+            witsensor_read_axis(x);
+            witsensor_read_outputmode(x);
         } else {
             post("witsensor: starting autoconnect...");
             x->pending_target = gensym(x->device_name[0] ? x->device_name : "*");
@@ -857,44 +910,43 @@ static void witsensor_disconnect(t_witsensor *x) {
 }
 
 // Set streaming rate (in Hz)
+// compact 0 = separate disp/speed/accel/gyro/timestamp/angle; compact 1 = one list (17 floats)
+static void witsensor_compact(t_witsensor *x, t_floatarg f) {
+    x->stream_compact = (f != 0) ? 1 : 0;
+}
+
 static void witsensor_set_rate(t_witsensor *x, t_float rate) {
     if (rate < 0.1f) rate = 0.1f;
     if (rate > 200.0f) rate = 200.0f;
-    
-    if (x->is_connected && x->ble_data) {
-        // Unlock sensor first
-        unsigned char cmd_unlock[] = {0xFF, 0xAA, 0x69, 0x88, 0xB5}; // Unlock command
-        witsensor_ble_simpleble_write_data(x->ble_data, cmd_unlock, sizeof(cmd_unlock));
-        
-        unsigned char rate_code;
-        if (rate <= 0.15f) rate_code = 0x01; // 0.1 Hz
-        else if (rate <= 0.75f) rate_code = 0x02; // 0.5 Hz
-        else if (rate <= 1.5f) rate_code = 0x03; // 1 Hz
-        else if (rate <= 3.0f) rate_code = 0x04; // 2 Hz
-        else if (rate <= 7.5f) rate_code = 0x05; // 5 Hz
-        else if (rate <= 15.0f) rate_code = 0x06; // 10 Hz
-        else if (rate <= 35.0f) rate_code = 0x07; // 20 Hz
-        else if (rate <= 75.0f) rate_code = 0x08; // 50 Hz
-        else if (rate <= 150.0f) rate_code = 0x09; // 100 Hz
-        else rate_code = 0x0B; // 200Hz
+    if (!witsensor_ensure_connected(x)) return;
+    // Unlock sensor first
+    unsigned char cmd_unlock[] = {0xFF, 0xAA, 0x69, 0x88, 0xB5}; // Unlock command
+    witsensor_ble_simpleble_write_data(x->ble_data, cmd_unlock, sizeof(cmd_unlock));
 
-        // Unlock and send rate immediately
-        // Small spacing; sensor accepts back-to-back frames over BLE without blocking main thread
-        unsigned char cmd_rate[] = {0xFF, 0xAA, 0x03, rate_code, 0x00};
-        witsensor_ble_simpleble_write_data(x->ble_data, cmd_rate, sizeof(cmd_rate));
+    unsigned char rate_code;
+    if (rate <= 0.15f) rate_code = 0x01; // 0.1 Hz
+    else if (rate <= 0.75f) rate_code = 0x02; // 0.5 Hz
+    else if (rate <= 1.5f) rate_code = 0x03; // 1 Hz
+    else if (rate <= 3.0f) rate_code = 0x04; // 2 Hz
+    else if (rate <= 7.5f) rate_code = 0x05; // 5 Hz
+    else if (rate <= 15.0f) rate_code = 0x06; // 10 Hz
+    else if (rate <= 35.0f) rate_code = 0x07; // 20 Hz
+    else if (rate <= 75.0f) rate_code = 0x08; // 50 Hz
+    else if (rate <= 150.0f) rate_code = 0x09; // 100 Hz
+    else rate_code = 0x0B; // 200Hz
 
-        t_atom args[2];
-        SETFLOAT(&args[0], rate);
-        SETFLOAT(&args[1], rate_code);
-        outlet_anything(x->status_out, gensym("rate"), 2, args);
-    } else {
-        post("witsensor: not connected to device");
-    }
+    unsigned char cmd_rate[] = {0xFF, 0xAA, 0x03, rate_code, 0x00};
+    witsensor_ble_simpleble_write_data(x->ble_data, cmd_rate, sizeof(cmd_rate));
+
+    t_atom args[2];
+    SETFLOAT(&args[0], rate);
+    SETFLOAT(&args[1], rate_code);
+    outlet_anything(x->status_out, gensym("rate"), 2, args);
 }
 
 // Set digital filter bandwidth (register 0x1F)
 static void witsensor_set_bandwidth(t_witsensor *x, t_float hz) {
-    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    if (!witsensor_ensure_connected(x)) return;
     unsigned char bw_code;
     if (hz >= 220.0f) bw_code = 0x00; // 256 Hz
     else if (hz >= 140.0f) bw_code = 0x01; // 188 Hz
@@ -913,9 +965,16 @@ static void witsensor_set_bandwidth(t_witsensor *x, t_float hz) {
     outlet_anything(x->status_out, gensym("bandwidth"), 1, &a);
 }
 
+// Returns 1 if connected and BLE ready; otherwise posts and returns 0. Safe for x==NULL.
+static int witsensor_ensure_connected(t_witsensor *x) {
+    if (x && x->is_connected && x->ble_data) return 1;
+    post("witsensor: not connected to device");
+    return 0;
+}
+
 // Battery request: FF AA 27 64 00
 static void witsensor_battery(t_witsensor *x) {
-    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    if (!witsensor_ensure_connected(x)) return;
     
     // Note: Battery requests may be unreliable with active streaming
     // Users should pause streaming (rate 0) before requesting battery data
@@ -925,7 +984,7 @@ static void witsensor_battery(t_witsensor *x) {
 
 // Request temperature data: FF AA 27 40 00
 static void witsensor_temp(t_witsensor *x) {
-    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    if (!witsensor_ensure_connected(x)) return;
     
     // Note: Temperature requests may be unreliable with active streaming
     // Users should pause streaming (rate 0) before requesting temperature data
@@ -935,7 +994,7 @@ static void witsensor_temp(t_witsensor *x) {
 
 // Request magnetic field data: FF AA 27 3A 00
 static void witsensor_mag(t_witsensor *x) {
-    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    if (!witsensor_ensure_connected(x)) return;
     
     // Note: Magnetic field requests may be unreliable with active streaming
     // Users should pause streaming (rate 0) before requesting magnetic field data
@@ -945,7 +1004,7 @@ static void witsensor_mag(t_witsensor *x) {
 
 // Request quaternion data: FF AA 27 51 00
 static void witsensor_quat(t_witsensor *x) {
-    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    if (!witsensor_ensure_connected(x)) return;
     
     // Note: Quaternion requests may be unreliable with active streaming
     // Users should pause streaming (rate 0) before requesting quaternion data
@@ -955,7 +1014,7 @@ static void witsensor_quat(t_witsensor *x) {
 
 // Read firmware version registers 0x2E and 0x2F
 static void witsensor_read_version(t_witsensor *x) {
-    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    if (!witsensor_ensure_connected(x)) return;
     unsigned char cmd1[] = {0xFF, 0xAA, 0x27, 0x2E, 0x00};
     unsigned char cmd2[] = {0xFF, 0xAA, 0x27, 0x2F, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd1, sizeof(cmd1));
@@ -964,7 +1023,7 @@ static void witsensor_read_version(t_witsensor *x) {
 
 // Read device time registers 0x30..0x33
 static void witsensor_read_time(t_witsensor *x) {
-    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    if (!witsensor_ensure_connected(x)) return;
     unsigned char c30[] = {0xFF, 0xAA, 0x27, 0x30, 0x00};
     unsigned char c31[] = {0xFF, 0xAA, 0x27, 0x31, 0x00};
     unsigned char c32[] = {0xFF, 0xAA, 0x27, 0x32, 0x00};
@@ -975,10 +1034,41 @@ static void witsensor_read_time(t_witsensor *x) {
     witsensor_ble_simpleble_write_data(x->ble_data, c33, sizeof(c33));
 }
 
+static void witsensor_read_rate(t_witsensor *x) {
+    if (!witsensor_ensure_connected(x)) return;
+    unsigned char cmd[] = {0xFF, 0xAA, 0x27, 0x03, 0x00};
+    witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
+}
+static void witsensor_read_bandwidth(t_witsensor *x) {
+    if (!witsensor_ensure_connected(x)) return;
+    unsigned char cmd[] = {0xFF, 0xAA, 0x27, 0x1F, 0x00};
+    witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
+}
+static void witsensor_read_axis(t_witsensor *x) {
+    if (!witsensor_ensure_connected(x)) return;
+    unsigned char cmd[] = {0xFF, 0xAA, 0x27, 0x24, 0x00};
+    witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
+}
+static void witsensor_read_outputmode(t_witsensor *x) {
+    if (!witsensor_ensure_connected(x)) return;
+    unsigned char cmd[] = {0xFF, 0xAA, 0x27, 0x96, 0x00};
+    witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
+}
+static void witsensor_read_orientation(t_witsensor *x) {
+    if (!witsensor_ensure_connected(x)) return;
+    unsigned char cmd[] = {0xFF, 0xAA, 0x27, 0x23, 0x00};
+    witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
+}
+static void witsensor_read_baud(t_witsensor *x) {
+    if (!witsensor_ensure_connected(x)) return;
+    unsigned char cmd[] = {0xFF, 0xAA, 0x27, 0x04, 0x00};
+    witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
+}
+
 // Set device RTC: settime year month day hour min sec [ms]. Unlock, write 0x30-0x33, save.
 static void witsensor_settime(t_witsensor *x, t_symbol *s, int argc, t_atom *argv) {
     (void)s;
-    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    if (!witsensor_ensure_connected(x)) return;
     if (argc < 6) {
         post("witsensor: settime year month day hour min sec [ms]");
         return;
@@ -1047,7 +1137,7 @@ static void witsensor_reset(t_witsensor *x) {
 
 // Set angle reference (zero): FF AA 01 08 00
 static void witsensor_xyzero(t_witsensor *x) {
-    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    if (!witsensor_ensure_connected(x)) return;
     unsigned char cmd[] = {0xFF, 0xAA, 0x01, 0x08, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
 }
@@ -1055,7 +1145,7 @@ static void witsensor_xyzero(t_witsensor *x) {
 
 // Set installation orientation: FF AA 23 <0|1> 00
 static void witsensor_set_orientation(t_witsensor *x, t_float f) {
-    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    if (!witsensor_ensure_connected(x)) return;
     int orient = (int)f; if (orient < 0) orient = 0; if (orient > 1) orient = 1;
     unsigned char cmd[] = {0xFF, 0xAA, 0x23, (unsigned char)orient, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
@@ -1063,7 +1153,7 @@ static void witsensor_set_orientation(t_witsensor *x, t_float f) {
 
 // Set output content (AGPVS): FF AA 96 <0..3> 00
 static void witsensor_set_output_mode(t_witsensor *x, t_float f) {
-    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    if (!witsensor_ensure_connected(x)) return;
     int mode = (int)f; if (mode < 0) mode = 0; if (mode > 3) mode = 3;
     unsigned char cmd[] = {0xFF, 0xAA, 0x96, (unsigned char)mode, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
@@ -1074,9 +1164,9 @@ static void witsensor_set_output_mode(t_witsensor *x, t_float f) {
     x->use_timestamp = ((mode >> 1) & 1);
 }
 
-// Set baud rate: FF AA 04 <0..255> 00
+// Set baud rate: FF AA 04 <0..255> 00 (serial/USB only; BLE ignores)
 static void witsensor_set_baud(t_witsensor *x, t_float f) {
-    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    if (!witsensor_ensure_connected(x)) return;
     int baud = (int)f; if (baud < 0) baud = 0; if (baud > 255) baud = 255;
     post("witsensor: setting baud rate to %d", baud);
     unsigned char cmd[] = {0xFF, 0xAA, 0x04, (unsigned char)baud, 0x00};
@@ -1085,7 +1175,7 @@ static void witsensor_set_baud(t_witsensor *x, t_float f) {
 
 // Save configuration: FF AA 00 00 00
 static void witsensor_save(t_witsensor *x) {
-    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    if (!witsensor_ensure_connected(x)) return;
     post("witsensor: saving configuration");
     unsigned char cmd[] = {0xFF, 0xAA, 0x00, 0x00, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
@@ -1093,11 +1183,7 @@ static void witsensor_save(t_witsensor *x) {
 
 // Restore configuration: FF AA 00 01 00
 static void witsensor_restore(t_witsensor *x) {
-    if (!x->is_connected || !x->ble_data) { 
-        post("witsensor: not connected to device"); 
-        return; 
-    }
-    
+    if (!witsensor_ensure_connected(x)) return;
     unsigned char cmd[] = {0xFF, 0xAA, 0x00, 0x01, 0x00};
     int result = witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
     
@@ -1205,6 +1291,7 @@ static void *witsensor_new(void) {
     x->ts_lo = x->ts_hi = 0;
     x->use_disp_speed = 0;
     x->use_timestamp = 0;
+    x->stream_compact = 0;
     
     return (void *)x;
 }
@@ -1233,9 +1320,76 @@ static void witsensor_free(t_witsensor *x) {
 
 // WIT sensor command functions
 
+// set <type> <value>: dispatch to setter; each callee validates its own args (and connection).
+static void witsensor_set_cmd(t_witsensor *x, t_symbol *s, int argc, t_atom *argv) {
+    (void)s;
+    if (argc < 1) {
+        pd_error(x, "witsensor set: usage set <type> [value...]");
+        return;
+    }
+    t_symbol *type = atom_getsymbol(argv + 0);
+    if (type == gensym("time")) {
+        witsensor_settime(x, s, argc - 1, argv + 1);
+        return;
+    }
+    if (type == gensym("name")) {
+        witsensor_setname(x, s, argc - 1, argv + 1);
+        return;
+    }
+    if (argc < 2) {
+        pd_error(x, "witsensor set: need value for %s", type->s_name);
+        return;
+    }
+    t_float val = atom_getfloat(argv + 1);
+    if (type == gensym("rate")) {
+        witsensor_set_rate(x, val);
+    } else if (type == gensym("bandwidth")) {
+        witsensor_set_bandwidth(x, val);
+    } else if (type == gensym("axis")) {
+        witsensor_axis(x, val);
+    } else if (type == gensym("outputmode")) {
+        witsensor_set_output_mode(x, val);
+    } else if (type == gensym("orientation")) {
+        witsensor_set_orientation(x, val);
+    } else if (type == gensym("baud")) {
+        witsensor_set_baud(x, val);
+    } else {
+        pd_error(x, "witsensor set: unknown type '%s'", type->s_name);
+    }
+}
+
+// get <type>: dispatch to read_* or outlet cached (name). All device reads go through a function.
+static void witsensor_get_cmd(t_witsensor *x, t_symbol *s, int argc, t_atom *argv) {
+    (void)s;
+    if (argc < 1) {
+        pd_error(x, "witsensor get: usage get <type>");
+        return;
+    }
+    t_symbol *type = atom_getsymbol(argv + 0);
+    if (type == gensym("name")) {
+        t_atom a;
+        SETSYMBOL(&a, gensym(x->device_name[0] ? x->device_name : ""));
+        outlet_anything(x->status_out, gensym("name"), 1, &a);
+        return;
+    }
+    if (type == gensym("rate")) { witsensor_read_rate(x); return; }
+    if (type == gensym("bandwidth")) { witsensor_read_bandwidth(x); return; }
+    if (type == gensym("axis")) { witsensor_read_axis(x); return; }
+    if (type == gensym("outputmode")) { witsensor_read_outputmode(x); return; }
+    if (type == gensym("orientation")) { witsensor_read_orientation(x); return; }
+    if (type == gensym("version")) { witsensor_read_version(x); return; }
+    if (type == gensym("time")) { witsensor_read_time(x); return; }
+    if (type == gensym("battery")) { witsensor_battery(x); return; }
+    if (type == gensym("temp")) { witsensor_temp(x); return; }
+    if (type == gensym("mag")) { witsensor_mag(x); return; }
+    if (type == gensym("quat")) { witsensor_quat(x); return; }
+    if (type == gensym("baud")) { witsensor_read_baud(x); return; }
+    pd_error(x, "witsensor get: unknown type '%s'", type->s_name);
+}
+
 // Calibration: calibrate (default=accel), calibrate 1 (mag), calibrate 2 (mag complete)
 static void witsensor_calibrate(t_witsensor *x) {
-    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    if (!witsensor_ensure_connected(x)) return;
     
     // Unlock
     unsigned char cmd_unlock[] = {0xFF, 0xAA, 0x69, 0x88, 0xB5};
@@ -1248,7 +1402,7 @@ static void witsensor_calibrate(t_witsensor *x) {
 
 // Set algorithm: 6-axis or 9-axis (register 0x24)
 static void witsensor_axis(t_witsensor *x, t_float axis_count) {
-    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    if (!witsensor_ensure_connected(x)) return;
     unsigned char code = 0x01; // default 6-axis
     if (axis_count == 9) {
         code = 0x00; // 9-axis
@@ -1263,7 +1417,7 @@ static void witsensor_axis(t_witsensor *x, t_float axis_count) {
 }
 
 static void witsensor_magcal_start(t_witsensor *x) {
-    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    if (!witsensor_ensure_connected(x)) return;
     unsigned char cmd_unlock[] = {0xFF, 0xAA, 0x69, 0x88, 0xB5};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_unlock, sizeof(cmd_unlock));
     unsigned char cmd_start[] = {0xFF, 0xAA, 0x01, 0x07, 0x00};
@@ -1273,7 +1427,7 @@ static void witsensor_magcal_start(t_witsensor *x) {
 }
 
 static void witsensor_magcal_stop(t_witsensor *x) {
-    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    if (!witsensor_ensure_connected(x)) return;
     unsigned char cmd_stop[] = {0xFF, 0xAA, 0x01, 0x00, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_stop, sizeof(cmd_stop));
     t_atom a; SETSYMBOL(&a, gensym("stop"));
@@ -1281,7 +1435,7 @@ static void witsensor_magcal_stop(t_witsensor *x) {
 }
 
 static void witsensor_zzero(t_witsensor *x) {
-    if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
+    if (!witsensor_ensure_connected(x)) return;
     unsigned char cmd_unlock[] = {0xFF, 0xAA, 0x69, 0x88, 0xB5};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_unlock, sizeof(cmd_unlock));
     unsigned char cmd_algo6[] = {0xFF, 0xAA, 0x24, 0x01, 0x00};
@@ -1316,31 +1470,18 @@ void witsensor_setup(void) {
     class_addmethod(witsensor_class, (t_method)witsensor_connect, gensym("connect"), A_GIMME, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_disconnect, gensym("disconnect"), 0);
     class_addmethod(witsensor_class, (t_method)witsensor_poll, gensym("poll"), A_SYMBOL, A_DEFFLOAT, 0);
-    class_addmethod(witsensor_class, (t_method)witsensor_set_rate, gensym("rate"), A_FLOAT, 0);
-    class_addmethod(witsensor_class, (t_method)witsensor_set_bandwidth, gensym("bandwidth"), A_FLOAT, 0);
-    class_addmethod(witsensor_class, (t_method)witsensor_axis, gensym("axis"), A_FLOAT, 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_compact, gensym("compact"), A_DEFFLOAT, 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_set_cmd, gensym("set"), A_GIMME, 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_get_cmd, gensym("get"), A_GIMME, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_calibrate, gensym("calibrate"), 0);
     class_addmethod(witsensor_class, (t_method)witsensor_magcal_start, gensym("magcal-start"), 0);
     class_addmethod(witsensor_class, (t_method)witsensor_magcal_stop, gensym("magcal-stop"), 0);
     class_addmethod(witsensor_class, (t_method)witsensor_xyzero, gensym("xyzero"), 0);
     class_addmethod(witsensor_class, (t_method)witsensor_zzero, gensym("zzero"), 0);
-    // About/version of the external
     class_addmethod(witsensor_class, (t_method)witsensor_version, gensym("about"), 0);
-    // Device queries
-    class_addmethod(witsensor_class, (t_method)witsensor_read_version, gensym("version"), 0);
-    class_addmethod(witsensor_class, (t_method)witsensor_read_time, gensym("time"), 0);
-    class_addmethod(witsensor_class, (t_method)witsensor_settime, gensym("settime"), A_GIMME, 0);
-    class_addmethod(witsensor_class, (t_method)witsensor_battery, gensym("battery"), 0);
-    class_addmethod(witsensor_class, (t_method)witsensor_temp, gensym("temp"), 0);
-    class_addmethod(witsensor_class, (t_method)witsensor_mag, gensym("mag"), 0);
-    class_addmethod(witsensor_class, (t_method)witsensor_quat, gensym("quat"), 0);
-    class_addmethod(witsensor_class, (t_method)witsensor_set_orientation, gensym("orientation"), A_DEFFLOAT, 0);
-    class_addmethod(witsensor_class, (t_method)witsensor_set_output_mode, gensym("outputmode"), A_DEFFLOAT, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_save, gensym("save"), 0);
     class_addmethod(witsensor_class, (t_method)witsensor_restore, gensym("restore"), 0);
-    class_addmethod(witsensor_class, (t_method)witsensor_set_baud, gensym("baud"), A_DEFFLOAT, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_reset, gensym("reset"), 0);
-    class_addmethod(witsensor_class, (t_method)witsensor_setname, gensym("setname"), A_GIMME, 0);
     
     witsensor_version();
 }
@@ -1350,10 +1491,13 @@ void witsensor_setup(void) {
 // Usage: setname <name>  (max 14 chars after "WT", spaces stripped)
 static void witsensor_setname(t_witsensor *x, t_symbol *s, int argc, t_atom *argv) {
     (void)s;
-    if (!x || !x->ble_data || !x->is_connected) { post("witsensor: not connected to device"); return; }
+    if (!witsensor_ensure_connected(x)) return;
+    if (argc < 1) {
+        post("witsensor set name: <name>");
+        return;
+    }
     const char *input = "";
-    if (argc >= 1 && argv[0].a_type == A_SYMBOL && argv[0].a_w.w_symbol &&
-        argv[0].a_w.w_symbol->s_name)
+    if (argv[0].a_type == A_SYMBOL && argv[0].a_w.w_symbol && argv[0].a_w.w_symbol->s_name)
         input = argv[0].a_w.w_symbol->s_name;
 
     const char *editable = input;
