@@ -14,7 +14,6 @@
 // Platform-specific includes
 #ifdef _WIN32
     #include <windows.h>
-    #define usleep(x) Sleep((x)/1000)  // usleep takes microseconds, Sleep takes milliseconds
 #else
     #include <unistd.h>
     #include <pthread.h>
@@ -319,6 +318,57 @@ static void witsensor_process_register_response(t_witsensor *x, unsigned char *d
         }
         return;
     }
+    /* Query response: rate (0x03), bandwidth (0x1F), axis (0x24), outputmode (0x96) - outlet current device state */
+    if (start == 0x03 && length >= 6) {
+        unsigned char code = (unsigned char)data[4];
+        static const float rate_hz[] = { 0.0f, 0.1f, 0.5f, 1.0f, 2.0f, 5.0f, 10.0f, 20.0f, 50.0f, 100.0f, 0.0f, 200.0f };
+        float hz = (code <= 0x0B) ? rate_hz[code] : 0.0f;
+        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
+        if (out) {
+            out->msg = gensym("rate");
+            out->argc = 2;
+            SETFLOAT(&out->argv[0], hz);
+            SETFLOAT(&out->argv[1], (t_float)code);
+            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+        }
+        return;
+    }
+    if (start == 0x1F && length >= 6) {
+        unsigned char code = (unsigned char)data[4];
+        static const float bw_hz[] = { 256.0f, 188.0f, 98.0f, 42.0f, 20.0f, 10.0f, 5.0f };
+        float hz = (code <= 6) ? bw_hz[code] : 0.0f;
+        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
+        if (out) {
+            out->msg = gensym("bandwidth");
+            out->argc = 1;
+            SETFLOAT(&out->argv[0], hz);
+            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+        }
+        return;
+    }
+    if (start == 0x24 && length >= 6) {
+        unsigned char code = (unsigned char)data[4];
+        int axis = (code == 0x01) ? 6 : 9;
+        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
+        if (out) {
+            out->msg = gensym("axis");
+            out->argc = 1;
+            SETFLOAT(&out->argv[0], (t_float)axis);
+            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+        }
+        return;
+    }
+    if (start == 0x96 && length >= 6) {
+        unsigned char mode = (unsigned char)data[4];
+        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
+        if (out) {
+            out->msg = gensym("outputmode");
+            out->argc = 1;
+            SETFLOAT(&out->argv[0], (t_float)mode);
+            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+        }
+        return;
+    }
     /* Device RTC: 0x30 YYMM, 0x31 DDHH, 0x32 MMSS, 0x33 MS. Per WIT protocol: YYMM = month[15:8] year[7:0], DDHH = hour[15:8] day[7:0], MMSS = sec[15:8] min[7:0]. */
     if (start == 0x30 && length >= 6) {
         x->rtc_yymm = (uint16_t)(data[4] | (data[5] << 8));
@@ -579,8 +629,13 @@ static void witsensor_poll_tick(t_witsensor *x) {
 
     // Only poll if connected and interval is set
     if (x->poll_interval > 0 && x->is_connected && x->poll_type) {
-        // Call the appropriate single-shot function based on poll_type
-        if (x->poll_type == gensym("quat")) {
+        if (x->poll_type == gensym("all")) {
+            witsensor_battery(x);
+            witsensor_temp(x);
+            witsensor_mag(x);
+            witsensor_quat(x);
+            witsensor_read_version(x);
+        } else if (x->poll_type == gensym("quat")) {
             witsensor_quat(x);
         } else if (x->poll_type == gensym("mag")) {
             witsensor_mag(x);
@@ -617,6 +672,8 @@ static void witsensor_pd_output_handler(t_pd *obj, void *data) {
     } else if (out->msg == gensym("version1")) {
         outlet_anything(x->status_out, out->msg, out->argc, out->argv);
     } else if (out->msg == gensym("version2")) {
+        outlet_anything(x->status_out, out->msg, out->argc, out->argv);
+    } else if (out->msg == gensym("rate") || out->msg == gensym("bandwidth") || out->msg == gensym("axis") || out->msg == gensym("outputmode")) {
         outlet_anything(x->status_out, out->msg, out->argc, out->argv);
     }
     
@@ -737,21 +794,18 @@ static void witsensor_connect(t_witsensor *x, t_symbol *s, int argc, t_atom *arg
             // On-connect configuration: set desired streaming/output mode consistently for Pd usage
             unsigned char cmd_unlock[] = {0xFF, 0xAA, 0x69, 0x88, 0xB5};
             witsensor_ble_simpleble_write_data(x->ble_data, cmd_unlock, sizeof(cmd_unlock));
-            usleep(50000);
             // Axis: 9-axis (reg 0x24, code 0x00)
             unsigned char cmd_axis9[] = {0xFF, 0xAA, 0x24, 0x00, 0x00};
             witsensor_ble_simpleble_write_data(x->ble_data, cmd_axis9, sizeof(cmd_axis9));
             x->axis_mode = 9;
             t_atom ax; SETFLOAT(&ax, 9);
             outlet_anything(x->status_out, gensym("axis"), 1, &ax);
-            usleep(30000);
             // Output mode (AGPVSEL, reg 0x96): 0 = accel+gyro+angle
             unsigned char cmd_outmode0[] = {0xFF, 0xAA, 0x96, 0x00, 0x00};
             witsensor_ble_simpleble_write_data(x->ble_data, cmd_outmode0, sizeof(cmd_outmode0));
             x->output_mode = 0;
             t_atom om; SETFLOAT(&om, 0);
             outlet_anything(x->status_out, gensym("outputmode"), 1, &om);
-            usleep(30000);
             // Default stream rate 50 Hz
             unsigned char cmd_rate[] = {0xFF, 0xAA, 0x03, 0x08, 0x00};
             witsensor_ble_simpleble_write_data(x->ble_data, cmd_rate, sizeof(cmd_rate));
@@ -759,13 +813,21 @@ static void witsensor_connect(t_witsensor *x, t_symbol *s, int argc, t_atom *arg
             SETFLOAT(&rate_args[0], 50.0f);
             SETFLOAT(&rate_args[1], 0x08);
             outlet_anything(x->status_out, gensym("rate"), 2, rate_args);
-            usleep(30000);
              // bandwidth 256 Hz
             unsigned char cmd_bw[] = {0xFF, 0xAA, 0x1F, 0x00, 0x00};
             witsensor_ble_simpleble_write_data(x->ble_data, cmd_bw, sizeof(cmd_bw));
             t_atom bw; SETFLOAT(&bw, 256.0f);
             outlet_anything(x->status_out, gensym("bandwidth"), 1, &bw);
             x->poll_interval = 0;
+            // Query current state so status reflects device registers (rate, bandwidth, axis, outputmode)
+            unsigned char q_rate[] = {0xFF, 0xAA, 0x27, 0x03, 0x00};
+            unsigned char q_bw[] = {0xFF, 0xAA, 0x27, 0x1F, 0x00};
+            unsigned char q_axis[] = {0xFF, 0xAA, 0x27, 0x24, 0x00};
+            unsigned char q_outmode[] = {0xFF, 0xAA, 0x27, 0x96, 0x00};
+            witsensor_ble_simpleble_write_data(x->ble_data, q_rate, sizeof(q_rate));
+            witsensor_ble_simpleble_write_data(x->ble_data, q_bw, sizeof(q_bw));
+            witsensor_ble_simpleble_write_data(x->ble_data, q_axis, sizeof(q_axis));
+            witsensor_ble_simpleble_write_data(x->ble_data, q_outmode, sizeof(q_outmode));
         } else {
             post("witsensor: starting autoconnect...");
             x->pending_target = gensym(x->device_name[0] ? x->device_name : "*");
@@ -843,7 +905,6 @@ static void witsensor_set_bandwidth(t_witsensor *x, t_float hz) {
     else bw_code = 0x06; // 5 Hz
     unsigned char cmd_unlock[] = {0xFF, 0xAA, 0x69, 0x88, 0xB5};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_unlock, sizeof(cmd_unlock));
-    usleep(50000);
     unsigned char cmd_bw[] = {0xFF, 0xAA, 0x1F, bw_code, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_bw, sizeof(cmd_bw));
     
@@ -898,7 +959,6 @@ static void witsensor_read_version(t_witsensor *x) {
     unsigned char cmd1[] = {0xFF, 0xAA, 0x27, 0x2E, 0x00};
     unsigned char cmd2[] = {0xFF, 0xAA, 0x27, 0x2F, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd1, sizeof(cmd1));
-    usleep(60000);
     witsensor_ble_simpleble_write_data(x->ble_data, cmd2, sizeof(cmd2));
 }
 
@@ -910,11 +970,8 @@ static void witsensor_read_time(t_witsensor *x) {
     unsigned char c32[] = {0xFF, 0xAA, 0x27, 0x32, 0x00};
     unsigned char c33[] = {0xFF, 0xAA, 0x27, 0x33, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, c30, sizeof(c30));
-    usleep(60000);
     witsensor_ble_simpleble_write_data(x->ble_data, c31, sizeof(c31));
-    usleep(60000);
     witsensor_ble_simpleble_write_data(x->ble_data, c32, sizeof(c32));
-    usleep(60000);
     witsensor_ble_simpleble_write_data(x->ble_data, c33, sizeof(c33));
 }
 
@@ -950,19 +1007,14 @@ static void witsensor_settime(t_witsensor *x, t_symbol *s, int argc, t_atom *arg
     uint16_t mmss = (uint16_t)((sec << 8) | (min & 0xFF));
     unsigned char unlock[] = {0xFF, 0xAA, 0x69, 0x88, 0xB5};
     witsensor_ble_simpleble_write_data(x->ble_data, unlock, sizeof(unlock));
-    usleep(50000);
     unsigned char w30[] = {0xFF, 0xAA, 0x30, (unsigned char)(yymm & 0xFF), (unsigned char)(yymm >> 8)};
     unsigned char w31[] = {0xFF, 0xAA, 0x31, (unsigned char)(ddh & 0xFF), (unsigned char)(ddh >> 8)};
     unsigned char w32[] = {0xFF, 0xAA, 0x32, (unsigned char)(mmss & 0xFF), (unsigned char)(mmss >> 8)};
     unsigned char w33[] = {0xFF, 0xAA, 0x33, (unsigned char)(ms & 0xFF), (unsigned char)(ms >> 8)};
     witsensor_ble_simpleble_write_data(x->ble_data, w30, sizeof(w30));
-    usleep(20000);
     witsensor_ble_simpleble_write_data(x->ble_data, w31, sizeof(w31));
-    usleep(20000);
     witsensor_ble_simpleble_write_data(x->ble_data, w32, sizeof(w32));
-    usleep(20000);
     witsensor_ble_simpleble_write_data(x->ble_data, w33, sizeof(w33));
-    usleep(20000);
     unsigned char save[] = {0xFF, 0xAA, 0x00, 0x00, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, save, sizeof(save));
     post("witsensor: RTC set to %04d-%02d-%02d %02d:%02d:%02d.%03d", year, month, day, hour, min, sec, ms);
@@ -1057,17 +1109,17 @@ static void witsensor_restore(t_witsensor *x) {
 }
 
 // Unified polling method: poll <type> <interval>
-// Examples: poll quat 10, poll mag 5, poll battery 1, poll temp 2
+// Examples: poll quat 10, poll all 5, poll mag 5, poll battery 1, poll temp 2
+// "all" = battery, temp, mag, quat, version each interval (like app recording row)
 static void witsensor_poll(t_witsensor *x, t_symbol *type, t_float interval) {
     if (!type) {
-        post("witsensor: poll requires a type (quat, mag, battery, temp)");
+        post("witsensor: poll requires a type (quat, mag, battery, temp, all)");
         return;
     }
     
-    // Validate type
     if (type != gensym("quat") && type != gensym("mag") && 
-        type != gensym("battery") && type != gensym("temp")) {
-        post("witsensor: poll type must be one of: quat, mag, battery, temp");
+        type != gensym("battery") && type != gensym("temp") && type != gensym("all")) {
+        post("witsensor: poll type must be one of: quat, mag, battery, temp, all");
         return;
     }
     
@@ -1075,14 +1127,11 @@ static void witsensor_poll(t_witsensor *x, t_symbol *type, t_float interval) {
     if (interval <= 0) {
         x->poll_interval = 0;
         x->poll_type = NULL;
-        // Stop the polling clock - streaming data has its own separate clock
         clock_unset(x->poll_clock);
         outlet_anything(x->status_out, gensym("poll"), 0, NULL);
         return;
     }
     
-    // Cap at 50 Hz to avoid BLE congestion
-    if (interval > 50.0f) interval = 50.0f;
     int period_ms = (int)(1000.0f / interval);
     if (period_ms < 1) period_ms = 1;
     
@@ -1191,7 +1240,6 @@ static void witsensor_calibrate(t_witsensor *x) {
     // Unlock
     unsigned char cmd_unlock[] = {0xFF, 0xAA, 0x69, 0x88, 0xB5};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_unlock, sizeof(cmd_unlock));
-    usleep(50000);
     post("witsensor: starting accelerometer calibration - keep sensor still");
     unsigned char cmd[] = {0xFF, 0xAA, 0x01, 0x01, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
@@ -1207,7 +1255,6 @@ static void witsensor_axis(t_witsensor *x, t_float axis_count) {
     }
     unsigned char cmd_unlock[] = {0xFF, 0xAA, 0x69, 0x88, 0xB5};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_unlock, sizeof(cmd_unlock));
-    usleep(50000);
     unsigned char cmd_algo[] = {0xFF, 0xAA, 0x24, code, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_algo, sizeof(cmd_algo));
     x->axis_mode = (axis_count == 9 ? 9 : 6);
@@ -1219,7 +1266,6 @@ static void witsensor_magcal_start(t_witsensor *x) {
     if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
     unsigned char cmd_unlock[] = {0xFF, 0xAA, 0x69, 0x88, 0xB5};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_unlock, sizeof(cmd_unlock));
-    usleep(50000);
     unsigned char cmd_start[] = {0xFF, 0xAA, 0x01, 0x07, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_start, sizeof(cmd_start));
     t_atom a; SETSYMBOL(&a, gensym("start"));
@@ -1238,10 +1284,8 @@ static void witsensor_zzero(t_witsensor *x) {
     if (!x->is_connected || !x->ble_data) { post("witsensor: not connected to device"); return; }
     unsigned char cmd_unlock[] = {0xFF, 0xAA, 0x69, 0x88, 0xB5};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_unlock, sizeof(cmd_unlock));
-    usleep(50000);
     unsigned char cmd_algo6[] = {0xFF, 0xAA, 0x24, 0x01, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_algo6, sizeof(cmd_algo6));
-    usleep(50000);
     unsigned char cmd_zeroz[] = {0xFF, 0xAA, 0x01, 0x04, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_zeroz, sizeof(cmd_zeroz));
     outlet_anything(x->status_out, gensym("zzero"), 0, NULL);
@@ -1329,13 +1373,11 @@ static void witsensor_setname(t_witsensor *x, t_symbol *s, int argc, t_atom *arg
 
     unsigned char unlock[] = {0xFF, 0xAA, 0x69, 0x88, 0xB5};
     witsensor_ble_simpleble_write_data(x->ble_data, unlock, sizeof(unlock));
-    usleep(100000);
 
     char cmd[64];
     int n = snprintf(cmd, sizeof(cmd), "WT%s\r\n", full_name);
     if (n > 0) {
         witsensor_ble_simpleble_write_request_raw(x->ble_data, (const unsigned char*)cmd, n);
-        usleep(10000);
         unsigned char save[] = {0xFF, 0xAA, 0x00, 0x00, 0x00};
         witsensor_ble_simpleble_write_data(x->ble_data, save, sizeof(save));
     }
