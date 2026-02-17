@@ -38,6 +38,16 @@
 #define WIT_CHAR_READ_UUID "0000ffe4-0000-1000-8000-00805f9a34fb"
 #define WIT_CHAR_WRITE_UUID "0000ffe9-0000-1000-8000-00805f9a34fb"
 
+/* Forward: streaming snapshot and de-jitter queue node (full defs after t_queued_streaming) */
+typedef struct _queued_streaming t_queued_streaming;
+typedef struct _dejitter_node t_dejitter_node;
+struct _dejitter_node {
+    t_queued_streaming *snap;
+    struct _dejitter_node *next;
+};
+#define MAX_DEJITTER_QUEUE 64
+#define DEJITTER_MIN_MS 5
+
 typedef struct _witsensor {
     t_object x_obj;
     
@@ -87,6 +97,14 @@ typedef struct _witsensor {
     int axis_mode;       // 6 or 9
     int output_mode;     // AGPVSEL 0..3
     int stream_compact;  // 0 = separate disp/speed/accel/gyro/timestamp/angle; 1 = one list
+    int stream_dejitter;  // 1 = buffer streaming packets and output at even intervals
+    t_float stream_dejitter_hz;  // target output rate when dejitter enabled
+    t_float stream_dejitter_catchup;  // speedup factor when queue builds (1.0=none, 1.2=20% faster)
+    t_float stream_dejitter_stretch;  // nominal interval multiplier (1.0=exact target, 1.05=5% slower)
+    t_clock *dejitter_clock;
+    t_dejitter_node *dejitter_head;
+    t_dejitter_node *dejitter_tail;
+    int dejitter_count;
     
     // BLE specific
     witsensor_ble_simpleble_t *ble_data;
@@ -117,6 +135,7 @@ static void witsensor_process_register_response(t_witsensor *x, unsigned char *d
 static void witsensor_process_streaming_data(t_witsensor *x, unsigned char *data, int length);
 static void witsensor_send_quaternion_data(t_witsensor *x);
 static void witsensor_poll_tick(t_witsensor *x);
+static void witsensor_dejitter_tick(t_witsensor *x);
 static void witsensor_battery(t_witsensor *x);
 static void witsensor_temp(t_witsensor *x);
 static void witsensor_mag(t_witsensor *x);
@@ -148,7 +167,7 @@ typedef struct _queued_datetime {
     int year, month, day, hour, min, sec, ms;
 } t_queued_datetime;
 /* Snapshot of streaming values per packet; avoids overwriting x before Pd handler runs */
-typedef struct _queued_streaming {
+struct _queued_streaming {
     float accel_x, accel_y, accel_z;
     float gyro_x, gyro_y, gyro_z;
     float disp_x, disp_y, disp_z;
@@ -157,7 +176,7 @@ typedef struct _queued_streaming {
     float angle_x, angle_y, angle_z;
     int use_disp_speed;
     int use_timestamp;
-} t_queued_streaming;
+};
 
 static void witsensor_pd_output_handler(t_pd *obj, void *data);
 static void witsensor_pd_streaming_handler(t_pd *obj, void *data);
@@ -735,8 +754,60 @@ static void witsensor_pd_streaming_handler(t_pd *obj, void *data) {
     if (!obj || !data) return;
     t_witsensor *x = (t_witsensor *)obj;
     t_queued_streaming *snap = (t_queued_streaming *)data;
+    if (x->stream_dejitter) {
+        /* Append to dejitter queue; clock will drain at even intervals */
+        if (x->dejitter_count >= MAX_DEJITTER_QUEUE) {
+            /* Drop oldest */
+            t_dejitter_node *old = x->dejitter_head;
+            if (old) {
+                x->dejitter_head = old->next;
+                if (x->dejitter_head == NULL) x->dejitter_tail = NULL;
+                x->dejitter_count--;
+                free(old->snap);
+                free(old);
+            }
+        }
+        t_dejitter_node *node = (t_dejitter_node *)malloc(sizeof(t_dejitter_node));
+        if (node) {
+            node->snap = snap;
+            node->next = NULL;
+            if (x->dejitter_tail) {
+                x->dejitter_tail->next = node;
+                x->dejitter_tail = node;
+            } else {
+                x->dejitter_head = x->dejitter_tail = node;
+                /* Start clock immediately for low latency */
+                clock_delay(x->dejitter_clock, 1);
+            }
+            x->dejitter_count++;
+        } else {
+            free(snap);
+        }
+    } else {
+        witsensor_send_sensor_data_from_snapshot(x, snap);
+        free(snap);
+    }
+}
+
+static void witsensor_dejitter_tick(t_witsensor *x) {
+    if (!x || !x->dejitter_head) return;
+    t_dejitter_node *node = x->dejitter_head;
+    x->dejitter_head = node->next;
+    if (x->dejitter_head == NULL) x->dejitter_tail = NULL;
+    x->dejitter_count--;
+    t_queued_streaming *snap = node->snap;
+    free(node);
     witsensor_send_sensor_data_from_snapshot(x, snap);
     free(snap);
+    if (x->dejitter_head && x->stream_dejitter_hz > 0.1) {
+        t_float target_ms = 1000.0f / x->stream_dejitter_hz;
+        int n = x->dejitter_count;
+        t_float stretch = (x->stream_dejitter_stretch >= 0.8f && x->stream_dejitter_stretch <= 1.5f) ? x->stream_dejitter_stretch : 1.0f;
+        t_float nominal = target_ms * stretch;
+        t_float cf = x->stream_dejitter_catchup;
+        t_float interval = (n > 8 && cf > 1.0f) ? (nominal / cf) : nominal;
+        clock_delay(x->dejitter_clock, (t_float)(int)interval);
+    }
 }
 
 // Function for polling requests (battery/temp/mag/quat)
@@ -783,21 +854,20 @@ static void witsensor_pd_output_handler(t_pd *obj, void *data) {
     if (!obj || !data) return;
     t_witsensor *x = (t_witsensor *)obj;
     t_queued_output *out = (t_queued_output *)data;
-    
-    if (out->msg == gensym("battery")) {
-        outlet_anything(x->status_out, out->msg, out->argc, out->argv);
-    } else if (out->msg == gensym("temp")) {
-        outlet_anything(x->status_out, out->msg, out->argc, out->argv);
-    } else if (out->msg == gensym("mag")) {
-        outlet_anything(x->data_out, out->msg, out->argc, out->argv);
-    } else if (out->msg == gensym("quat")) {
+
+    if (out->msg == gensym("quat")) {
         witsensor_send_quaternion_data(x);
     } else if (out->msg == gensym("version_combined") && out->argc >= 2) {
         outlet_anything(x->status_out, gensym("version"), 2, out->argv);
-    } else if (out->msg == gensym("rate") || out->msg == gensym("bandwidth") || out->msg == gensym("axis") || out->msg == gensym("outputmode")) {
-        outlet_anything(x->status_out, out->msg, out->argc, out->argv);
+    } else {
+        if (out->msg == gensym("rate") && x->stream_dejitter && out->argc >= 1) {
+            t_float hz = atom_getfloat(out->argv);
+            if (hz > 0.1f && hz <= 200.0f) x->stream_dejitter_hz = hz;
+        }
+        t_outlet *dest = (out->msg == gensym("mag")) ? x->data_out : x->status_out;
+        outlet_anything(dest, out->msg, out->argc, out->argv);
     }
-    
+
     free(out);
 }
 
@@ -943,9 +1013,41 @@ static void witsensor_disconnect(t_witsensor *x) {
 }
 
 // Set streaming rate (in Hz)
-// compact 0 = separate disp/speed/accel/gyro/timestamp/angle; compact 1 = one list (17 floats)
+// compact 0 = separate disp/speed/accel/gyro/timestamp/angle; compact 1 = one list
 static void witsensor_compact(t_witsensor *x, t_floatarg f) {
     x->stream_compact = (f != 0) ? 1 : 0;
+}
+
+// dejitter-stretch <factor> - nominal interval multiplier (1.0=exact, 1.05=5% slower to absorb jitter)
+static void witsensor_dejitter_stretch(t_witsensor *x, t_floatarg f) {
+    x->stream_dejitter_stretch = (f >= 0.8f && f <= 1.5f) ? f : 1.0f;
+}
+
+// dejitter-catchup <factor> - when queue > 8, drain factor× faster (1.0=none, 1.2=20% faster)
+static void witsensor_dejitter_catchup(t_witsensor *x, t_floatarg f) {
+    x->stream_dejitter_catchup = (f >= 1.0f && f <= 3.0f) ? f : 1.1f;
+}
+
+// dejitter [0|1] - buffer streaming packets and output at device rate (queries rate when enabling)
+static void witsensor_dejitter(t_witsensor *x, t_symbol *s, int argc, t_atom *argv) {
+    (void)s;
+    if (argc >= 1) {
+        x->stream_dejitter = (atom_getfloat(argv) != 0) ? 1 : 0;
+        if (x->stream_dejitter) {
+            if (argc < 2) witsensor_read_rate(x);  /* query device rate to sync stream_dejitter_hz */
+        } else {
+            clock_unset(x->dejitter_clock);
+            /* Flush queue */
+            while (x->dejitter_head) {
+                t_dejitter_node *node = x->dejitter_head;
+                x->dejitter_head = node->next;
+                free(node->snap);
+                free(node);
+            }
+            x->dejitter_tail = NULL;
+            x->dejitter_count = 0;
+        }
+    }
 }
 
 static void witsensor_set_rate(t_witsensor *x, t_float rate) {
@@ -970,6 +1072,7 @@ static void witsensor_set_rate(t_witsensor *x, t_float rate) {
 
     unsigned char cmd_rate[] = {0xFF, 0xAA, 0x03, rate_code, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_rate, sizeof(cmd_rate));
+    if (x->stream_dejitter && rate > 0.1f && rate <= 200.0f) x->stream_dejitter_hz = rate;
 }
 
 // Set digital filter bandwidth (register 0x1F)
@@ -1158,7 +1261,16 @@ static void witsensor_settime(t_witsensor *x, t_symbol *s, int argc, t_atom *arg
 static void witsensor_reset(t_witsensor *x) {
     if (!x || !x->ble_data) { post("witsensor: BLE not initialized"); return; }
     clock_unset(x->staged_read_clock);
+    clock_unset(x->dejitter_clock);
     x->staged_read_type = STAGED_READ_NONE;
+    while (x->dejitter_head) {
+        t_dejitter_node *node = x->dejitter_head;
+        x->dejitter_head = node->next;
+        free(node->snap);
+        free(node);
+    }
+    x->dejitter_tail = NULL;
+    x->dejitter_count = 0;
     // Stop scanning if active
     if (witsensor_ble_simpleble_is_scanning(x->ble_data)) {
         witsensor_ble_simpleble_stop_scanning(x->ble_data);
@@ -1334,6 +1446,13 @@ static void *witsensor_new(void) {
     x->use_disp_speed = 0;
     x->use_timestamp = 0;
     x->stream_compact = 0;
+    x->stream_dejitter = 0;
+    x->stream_dejitter_hz = 50.0f;
+    x->stream_dejitter_catchup = 1.1f;
+    x->stream_dejitter_stretch = 1.0f;
+    x->dejitter_clock = clock_new(x, (t_method)witsensor_dejitter_tick);
+    x->dejitter_head = x->dejitter_tail = NULL;
+    x->dejitter_count = 0;
     
     return (void *)x;
 }
@@ -1358,8 +1477,18 @@ static void witsensor_free(t_witsensor *x) {
         x->seen_count = 0;
     }
     clock_unset(x->staged_read_clock);
+    clock_unset(x->dejitter_clock);
     clock_free(x->staged_read_clock);
+    clock_free(x->dejitter_clock);
     clock_free(x->poll_clock);
+    /* Flush dejitter queue */
+    while (x->dejitter_head) {
+        t_dejitter_node *node = x->dejitter_head;
+        x->dejitter_head = node->next;
+        free(node->snap);
+        free(node);
+    }
+    x->dejitter_tail = NULL;
 }
 
 // WIT sensor command functions
@@ -1522,6 +1651,9 @@ void witsensor_setup(void) {
     class_addmethod(witsensor_class, (t_method)witsensor_disconnect, gensym("disconnect"), 0);
     class_addmethod(witsensor_class, (t_method)witsensor_poll, gensym("poll"), A_SYMBOL, A_DEFFLOAT, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_compact, gensym("compact"), A_DEFFLOAT, 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_dejitter, gensym("dejitter"), A_GIMME, 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_dejitter_catchup, gensym("dejitter-catchup"), A_DEFFLOAT, 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_dejitter_stretch, gensym("dejitter-stretch"), A_DEFFLOAT, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_set_cmd, gensym("set"), A_GIMME, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_get_cmd, gensym("get"), A_GIMME, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_calibrate, gensym("calibrate"), 0);
