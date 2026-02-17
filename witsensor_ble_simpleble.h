@@ -9,6 +9,7 @@
 #ifndef WITSENSOR_BLE_SIMPLEBLE_H
 #define WITSENSOR_BLE_SIMPLEBLE_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -63,6 +64,8 @@ int witsensor_ble_simpleble_write_request_raw(witsensor_ble_simpleble_t *ble_dat
 int witsensor_ble_simpleble_set_notifications_enabled(witsensor_ble_simpleble_t *ble_data, int enabled);
 int witsensor_ble_simpleble_is_connected(witsensor_ble_simpleble_t *ble_data);
 int witsensor_ble_simpleble_is_scanning(witsensor_ble_simpleble_t *ble_data);
+// Get connected device's BLE address (e.g. "AA:BB:CC:DD:EE:FF"). Returns 1 on success, 0 if not connected.
+int witsensor_ble_simpleble_get_connected_address(witsensor_ble_simpleble_t *ble_data, char *buf, size_t bufsize);
 // Permission probe: returns number of devices found after a short bounded scan,
 // or -1 on initialization failure
 int witsensor_ble_simpleble_ensure_initialized(witsensor_ble_simpleble_t *ble_data);

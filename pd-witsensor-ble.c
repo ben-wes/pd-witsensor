@@ -12,9 +12,7 @@
 #include <time.h>
 
 // Platform-specific includes
-#ifdef _WIN32
-    #include <windows.h>
-#else
+#ifndef _WIN32
     #include <unistd.h>
     #include <pthread.h>
 #endif
@@ -30,6 +28,10 @@
 
 #define MAX_DEVICES 20
 #define PACKET_SIZE 20
+
+#define STAGED_READ_NONE  0
+#define STAGED_READ_VERSION 1
+#define STAGED_READ_TIME   2
 
 // WIT sensor UUIDs
 #define WIT_SERVICE_UUID "0000ffe5-0000-1000-8000-00805f9a34fb"
@@ -76,6 +78,10 @@ typedef struct _witsensor {
     t_clock *poll_clock;
     t_float poll_interval;
     t_symbol *poll_type;  // "quat", "mag", "battery", "temp", etc.
+    // Staged multi-register reads (replace usleep with clock_delay to avoid audio dropouts)
+    t_clock *staged_read_clock;
+    int staged_read_type;   // 0=none, 1=version, 2=time
+    int staged_read_step;
     
     // Tracked sensor state
     int axis_mode;       // 6 or 9
@@ -92,9 +98,12 @@ typedef struct _witsensor {
     // Dedupe device announcements per scan
     char **seen_ids;
     unsigned long seen_count;
-    // Device RTC buffer (for parsed date/time when we have all four registers)
-    uint16_t rtc_yymm, rtc_ddh, rtc_mmss;
-    
+    // Time read: buffer all four register responses (0x30..0x33) before building; they can arrive in any order
+    uint16_t time_buf_yymm, time_buf_ddh, time_buf_mmss, time_buf_ms;
+    uint8_t time_buf_flags;  /* 0x01=got 0x30, 0x02=0x31, 0x04=0x32, 0x08=0x33 */
+    // Version read: buffer 0x2E and 0x2F before combining
+    uint16_t version_buf_v1, version_buf_v2;
+    uint8_t version_buf_flags;  /* 0x01=got 0x2E, 0x02=got 0x2F */
 } t_witsensor;
 
 t_class *witsensor_class;
@@ -116,12 +125,11 @@ static void witsensor_save(t_witsensor *x);
 static void witsensor_restore(t_witsensor *x);
 static void witsensor_read_version(t_witsensor *x);
 static void witsensor_read_time(t_witsensor *x);
+static void witsensor_staged_read_tick(t_witsensor *x);
 static void witsensor_read_rate(t_witsensor *x);
 static void witsensor_read_bandwidth(t_witsensor *x);
 static void witsensor_read_axis(t_witsensor *x);
 static void witsensor_read_outputmode(t_witsensor *x);
-static void witsensor_read_orientation(t_witsensor *x);
-static void witsensor_read_baud(t_witsensor *x);
 static void witsensor_settime(t_witsensor *x, t_symbol *s, int argc, t_atom *argv);
 static void witsensor_reset(t_witsensor *x);
 static void witsensor_setname(t_witsensor *x, t_symbol *s, int argc, t_atom *argv);
@@ -309,24 +317,34 @@ static void witsensor_process_register_response(t_witsensor *x, unsigned char *d
         return;
     }
     if (start == 0x2E && length >= 6) {
-        uint16_t v1 = (uint16_t)(data[4] | (data[5] << 8));
-        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
-        if (out) {
-            out->msg = gensym("version1");
-            out->argc = 1;
-            SETFLOAT(&out->argv[0], (t_float)v1);
-            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+        x->version_buf_v1 = (uint16_t)(data[4] | (data[5] << 8));
+        x->version_buf_flags |= 0x01;
+        if (x->version_buf_flags == 0x03) {
+            t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
+            if (out) {
+                out->msg = gensym("version_combined");
+                out->argc = 2;
+                SETFLOAT(&out->argv[0], (t_float)x->version_buf_v1);
+                SETFLOAT(&out->argv[1], (t_float)x->version_buf_v2);
+                pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+            }
+            x->version_buf_flags = 0;
         }
         return;
     }
     if (start == 0x2F && length >= 6) {
-        uint16_t v2 = (uint16_t)(data[4] | (data[5] << 8));
-        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
-        if (out) {
-            out->msg = gensym("version2");
-            out->argc = 1;
-            SETFLOAT(&out->argv[0], (t_float)v2);
-            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+        x->version_buf_v2 = (uint16_t)(data[4] | (data[5] << 8));
+        x->version_buf_flags |= 0x02;
+        if (x->version_buf_flags == 0x03) {
+            t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
+            if (out) {
+                out->msg = gensym("version_combined");
+                out->argc = 2;
+                SETFLOAT(&out->argv[0], (t_float)x->version_buf_v1);
+                SETFLOAT(&out->argv[1], (t_float)x->version_buf_v2);
+                pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+            }
+            x->version_buf_flags = 0;
         }
         return;
     }
@@ -338,9 +356,8 @@ static void witsensor_process_register_response(t_witsensor *x, unsigned char *d
         t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
         if (out) {
             out->msg = gensym("rate");
-            out->argc = 2;
+            out->argc = 1;
             SETFLOAT(&out->argv[0], hz);
-            SETFLOAT(&out->argv[1], (t_float)code);
             pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
         }
         return;
@@ -381,49 +398,61 @@ static void witsensor_process_register_response(t_witsensor *x, unsigned char *d
         }
         return;
     }
-    if (start == 0x23 && length >= 6) {
-        unsigned char orient = (unsigned char)data[4];
-        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
-        if (out) {
-            out->msg = gensym("orientation");
-            out->argc = 1;
-            SETFLOAT(&out->argv[0], (t_float)(orient & 1));
-            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+    /* Device RTC: 0x30 YYMM, 0x31 DDHH, 0x32 MMSS, 0x33 MS.
+     * Some devices return all 4 words in one packet (read 0x30 returns block); others send 4 separate packets. */
+    if (start == 0x30 && length >= 12) {
+        /* Single-packet block: all 4 words at data[4..11] - use only if values look valid */
+        uint16_t yymm = (uint16_t)(data[4] | (data[5] << 8));
+        uint16_t ddh = (uint16_t)(data[6] | (data[7] << 8));
+        uint16_t mmss = (uint16_t)(data[8] | (data[9] << 8));
+        uint16_t ms = (uint16_t)(data[10] | (data[11] << 8));
+        int year = 2000 + (int)(yymm & 0xFF);
+        int month = (int)((yymm >> 8) & 0xFF);
+        int day = (int)(ddh & 0xFF);
+        int hour = (int)((ddh >> 8) & 0xFF);
+        int min = (int)(mmss & 0xFF);
+        int sec = (int)((mmss >> 8) & 0xFF);
+        if (month >= 1 && month <= 12 && day >= 1 && day <= 31 && hour <= 23 && min <= 59 && sec <= 59 && ms <= 999) {
+            t_queued_datetime *dt = (t_queued_datetime *)malloc(sizeof(t_queued_datetime));
+            if (dt) {
+                dt->year = year;
+                dt->month = month;
+                dt->day = day;
+                dt->hour = hour;
+                dt->min = min;
+                dt->sec = sec;
+                dt->ms = (int)ms;
+                pd_queue_mess(x->pd_instance, (t_pd *)x, dt, witsensor_pd_datetime_handler);
+            }
+            return;
         }
-        return;
+        /* Failed validation - likely 4-packet format with garbage in data[6..11]; fall through */
     }
-    if (start == 0x04 && length >= 6) {
-        unsigned char baud_code = (unsigned char)data[4];
-        t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
-        if (out) {
-            out->msg = gensym("baud");
-            out->argc = 1;
-            SETFLOAT(&out->argv[0], (t_float)baud_code);
-            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
-        }
-        return;
-    }
-    /* Device RTC: 0x30 YYMM, 0x31 DDHH, 0x32 MMSS, 0x33 MS. Per WIT protocol: YYMM = month[15:8] year[7:0], DDHH = hour[15:8] day[7:0], MMSS = sec[15:8] min[7:0]. */
     if (start == 0x30 && length >= 6) {
-        x->rtc_yymm = (uint16_t)(data[4] | (data[5] << 8));
+        x->time_buf_yymm = (uint16_t)(data[4] | (data[5] << 8));
+        x->time_buf_flags |= 0x01;
         return;
     }
     if (start == 0x31 && length >= 6) {
-        x->rtc_ddh = (uint16_t)(data[4] | (data[5] << 8));
+        x->time_buf_ddh = (uint16_t)(data[4] | (data[5] << 8));
+        x->time_buf_flags |= 0x02;
         return;
     }
     if (start == 0x32 && length >= 6) {
-        x->rtc_mmss = (uint16_t)(data[4] | (data[5] << 8));
+        x->time_buf_mmss = (uint16_t)(data[4] | (data[5] << 8));
+        x->time_buf_flags |= 0x04;
         return;
     }
     if (start == 0x33 && length >= 6) {
-        uint16_t ms = (uint16_t)(data[4] | (data[5] << 8));
-        int year = 2000 + (int)(x->rtc_yymm & 0xFF);
-        int month = (int)((x->rtc_yymm >> 8) & 0xFF);
-        int day = (int)(x->rtc_ddh & 0xFF);
-        int hour = (int)((x->rtc_ddh >> 8) & 0xFF);
-        int min = (int)(x->rtc_mmss & 0xFF);
-        int sec = (int)((x->rtc_mmss >> 8) & 0xFF);
+        x->time_buf_ms = (uint16_t)(data[4] | (data[5] << 8));
+        x->time_buf_flags |= 0x08;
+        if (x->time_buf_flags != 0x0F) return;
+        int year = 2000 + (int)(x->time_buf_yymm & 0xFF);
+        int month = (int)((x->time_buf_yymm >> 8) & 0xFF);
+        int day = (int)(x->time_buf_ddh & 0xFF);
+        int hour = (int)((x->time_buf_ddh >> 8) & 0xFF);
+        int min = (int)(x->time_buf_mmss & 0xFF);
+        int sec = (int)((x->time_buf_mmss >> 8) & 0xFF);
         t_queued_datetime *dt = (t_queued_datetime *)malloc(sizeof(t_queued_datetime));
         if (dt) {
             dt->year = year;
@@ -432,7 +461,7 @@ static void witsensor_process_register_response(t_witsensor *x, unsigned char *d
             dt->hour = hour;
             dt->min = min;
             dt->sec = sec;
-            dt->ms = (int)ms;
+            dt->ms = (int)x->time_buf_ms;
             pd_queue_mess(x->pd_instance, (t_pd *)x, dt, witsensor_pd_datetime_handler);
         }
         return;
@@ -482,63 +511,60 @@ void witsensor_pd_scanning_handler(t_pd *obj, void *data) {
 void witsensor_pd_device_found_handler(t_pd *obj, void *data) {
     t_witsensor *x = (t_witsensor *)obj;
     t_queued_device *d = (t_queued_device *)data;
-    if (x && d) {
-        // Dedupe in current session
-        if (d->id) {
-            int seen = 0;
-            for (unsigned long i = 0; i < x->seen_count; i++) {
-                if (x->seen_ids && x->seen_ids[i] && strcmp(x->seen_ids[i], d->id) == 0) { seen = 1; break; }
-            }
-            if (!seen) {
-                char **new_ids = (char**)realloc(x->seen_ids, (x->seen_count + 1) * sizeof(char*));
-                if (new_ids) {
-                    x->seen_ids = new_ids;
-                    x->seen_ids[x->seen_count] = strdup(d->id);
-                    x->seen_count++;
-                }
+    if (!d) return;
+    if (!x || x->is_connected) goto cleanup;
+    // Dedupe in current session
+    if (d->id) {
+        int seen = 0;
+        for (unsigned long i = 0; i < x->seen_count; i++) {
+            if (x->seen_ids && x->seen_ids[i] && strcmp(x->seen_ids[i], d->id) == 0) { seen = 1; break; }
+        }
+        if (!seen) {
+            char **new_ids = (char**)realloc(x->seen_ids, (x->seen_count + 1) * sizeof(char*));
+            if (new_ids) {
+                x->seen_ids = new_ids;
+                x->seen_ids[x->seen_count] = strdup(d->id);
+                x->seen_count++;
             }
         }
-        if (x->pending_target && !x->is_connected && x->is_scanning) {
-            int should_connect = 0;
-            const char *target = x->pending_target->s_name;
-            if (target && target[0] && strcmp(target, "*") != 0) {
-                if ((d->id && strcmp(d->id, target) == 0) || (d->addr && strcmp(d->addr, target) == 0)) {
-                    should_connect = 1;
-                }
-            } else if (target && strcmp(target, "*") == 0) {
-                if (d->tag && strcmp(d->tag, "wit") == 0) {
-                    should_connect = 1;
-                }
-            }
-            if (should_connect && d->id) {
-                // Emit device status before autoconnect so UI sees the WIT
-                t_atom da[3];
-                SETSYMBOL(&da[0], gensym(d->tag ? d->tag : "other"));
-                SETSYMBOL(&da[1], gensym(d->addr ? d->addr : ""));
-                SETSYMBOL(&da[2], gensym(d->id));
-                outlet_anything(x->status_out, gensym("device"), 3, da);
-                // Emit autoconnecting notice
-                t_atom ac[1]; SETSYMBOL(&ac[0], gensym(d->id));
-                outlet_anything(x->status_out, gensym("autoconnecting"), 1, ac);
-                // Reuse Pd-level connect (A_GIMME signature)
-                t_atom a[1];
-                SETSYMBOL(&a[0], gensym(d->id));
-                witsensor_connect(x, &s_, 1, a);
-                // Clear pending_target after initiating connect to avoid duplicate autoconnects
-                x->pending_target = NULL;
-                if (d->tag) free(d->tag);
-                if (d->addr) free(d->addr);
-                if (d->id) free(d->id);
-                free(d);
-                return;
-            }
-        }
-        t_atom a[3];
-        SETSYMBOL(&a[0], gensym(d->tag ? d->tag : "other"));
-        SETSYMBOL(&a[1], gensym(d->addr ? d->addr : ""));
-        SETSYMBOL(&a[2], gensym(d->id ? d->id : ""));
-        outlet_anything(x->status_out, gensym("device"), 3, a);
     }
+    if (x->pending_target && !x->is_connected && x->is_scanning) {
+        int should_connect = 0;
+        const char *target = x->pending_target->s_name;
+        if (target && target[0] && strcmp(target, "*") != 0) {
+            if ((d->id && strcmp(d->id, target) == 0) || (d->addr && strcmp(d->addr, target) == 0)) {
+                should_connect = 1;
+            }
+        } else if (target && strcmp(target, "*") == 0) {
+            if (d->tag && strcmp(d->tag, "wit") == 0) {
+                should_connect = 1;
+            }
+        }
+        if (should_connect && d->id) {
+            // Emit device status before autoconnect so UI sees the WIT
+            t_atom da[3];
+            SETSYMBOL(&da[0], gensym(d->tag ? d->tag : "other"));
+            SETSYMBOL(&da[1], gensym(d->addr ? d->addr : ""));
+            SETSYMBOL(&da[2], gensym(d->id));
+            outlet_anything(x->status_out, gensym("device"), 3, da);
+            // Emit autoconnecting notice
+            t_atom ac[1]; SETSYMBOL(&ac[0], gensym(d->id));
+            outlet_anything(x->status_out, gensym("autoconnecting"), 1, ac);
+            // Reuse Pd-level connect (A_GIMME signature)
+            t_atom a[1];
+            SETSYMBOL(&a[0], gensym(d->id));
+            witsensor_connect(x, &s_, 1, a);
+            // Clear pending_target after initiating connect to avoid duplicate autoconnects
+            x->pending_target = NULL;
+            goto cleanup;
+        }
+    }
+    t_atom a[3];
+    SETSYMBOL(&a[0], gensym(d->tag ? d->tag : "other"));
+    SETSYMBOL(&a[1], gensym(d->addr ? d->addr : ""));
+    SETSYMBOL(&a[2], gensym(d->id ? d->id : ""));
+    outlet_anything(x->status_out, gensym("device"), 3, a);
+cleanup:
     if (d) {
         if (d->tag) free(d->tag);
         if (d->addr) free(d->addr);
@@ -603,29 +629,69 @@ static void witsensor_send_quaternion_data(t_witsensor *x) {
     outlet_anything(x->data_out, gensym("quat"), 4, args);
 }
 
-/* Send sensor data from a queued snapshot. If stream_compact: one list (17 floats). Else: separate messages. */
+/* Timestamp: 32-bit little-endian from ts_hi (high word) and ts_lo (low word), unit ms. Split into seconds and ms so Pd doesn't show 1e6 for large values. */
+static void witsensor_ts_to_sec_ms(unsigned short ts_hi, unsigned short ts_lo, int *sec_out, int *ms_out) {
+    uint32_t ms = (uint32_t)ts_hi << 16 | ts_lo;
+    *sec_out = (int)(ms / 1000);
+    *ms_out = (int)(ms % 1000);
+}
+
+/* Send sensor data from a queued snapshot. If stream_compact: one list. Timestamp is seconds + ms (two values) to avoid Pd 1e6 display. */
 static void witsensor_send_sensor_data_from_snapshot(t_witsensor *x, const t_queued_streaming *snap) {
+    int ts_sec, ts_ms;
+    witsensor_ts_to_sec_ms(snap->ts_hi, snap->ts_lo, &ts_sec, &ts_ms);
     if (x->stream_compact) {
-        /* Fixed order: disp_xyz, speed_xyz, accel_xyz, gyro_xyz, ts_hi, ts_lo, angle_xyz (17 floats) */
-        t_atom a[17];
-        SETFLOAT(&a[0], snap->disp_x);
-        SETFLOAT(&a[1], snap->disp_y);
-        SETFLOAT(&a[2], snap->disp_z);
-        SETFLOAT(&a[3], snap->speed_x);
-        SETFLOAT(&a[4], snap->speed_y);
-        SETFLOAT(&a[5], snap->speed_z);
-        SETFLOAT(&a[6], snap->accel_x);
-        SETFLOAT(&a[7], snap->accel_y);
-        SETFLOAT(&a[8], snap->accel_z);
-        SETFLOAT(&a[9], snap->gyro_x);
-        SETFLOAT(&a[10], snap->gyro_y);
-        SETFLOAT(&a[11], snap->gyro_z);
-        SETFLOAT(&a[12], (t_float)snap->ts_hi);
-        SETFLOAT(&a[13], (t_float)snap->ts_lo);
-        SETFLOAT(&a[14], snap->angle_x);
-        SETFLOAT(&a[15], snap->angle_y);
-        SETFLOAT(&a[16], snap->angle_z);
-        outlet_anything(x->data_out, gensym("list"), 17, a);
+        /* Layout: 0/1 = 9 floats (no ts). 2/3 = 9 floats (accel/gyro or disp/speed + ts_sec ts_ms + angle_z). */
+        t_atom a[9];
+        int n;
+        if (!snap->use_timestamp) {
+            n = 9;
+            if (snap->use_disp_speed) {
+                SETFLOAT(&a[0], snap->disp_x);
+                SETFLOAT(&a[1], snap->disp_y);
+                SETFLOAT(&a[2], snap->disp_z);
+                SETFLOAT(&a[3], snap->speed_x);
+                SETFLOAT(&a[4], snap->speed_y);
+                SETFLOAT(&a[5], snap->speed_z);
+                SETFLOAT(&a[6], snap->angle_x);
+                SETFLOAT(&a[7], snap->angle_y);
+                SETFLOAT(&a[8], snap->angle_z);
+            } else {
+                SETFLOAT(&a[0], snap->accel_x);
+                SETFLOAT(&a[1], snap->accel_y);
+                SETFLOAT(&a[2], snap->accel_z);
+                SETFLOAT(&a[3], snap->gyro_x);
+                SETFLOAT(&a[4], snap->gyro_y);
+                SETFLOAT(&a[5], snap->gyro_z);
+                SETFLOAT(&a[6], snap->angle_x);
+                SETFLOAT(&a[7], snap->angle_y);
+                SETFLOAT(&a[8], snap->angle_z);
+            }
+        } else {
+            n = 9;
+            if (snap->use_disp_speed) {
+                SETFLOAT(&a[0], snap->disp_x);
+                SETFLOAT(&a[1], snap->disp_y);
+                SETFLOAT(&a[2], snap->disp_z);
+                SETFLOAT(&a[3], snap->speed_x);
+                SETFLOAT(&a[4], snap->speed_y);
+                SETFLOAT(&a[5], snap->speed_z);
+                SETFLOAT(&a[6], (t_float)ts_sec);
+                SETFLOAT(&a[7], (t_float)ts_ms);
+                SETFLOAT(&a[8], snap->angle_z);
+            } else {
+                SETFLOAT(&a[0], snap->accel_x);
+                SETFLOAT(&a[1], snap->accel_y);
+                SETFLOAT(&a[2], snap->accel_z);
+                SETFLOAT(&a[3], snap->gyro_x);
+                SETFLOAT(&a[4], snap->gyro_y);
+                SETFLOAT(&a[5], snap->gyro_z);
+                SETFLOAT(&a[6], (t_float)ts_sec);
+                SETFLOAT(&a[7], (t_float)ts_ms);
+                SETFLOAT(&a[8], snap->angle_z);
+            }
+        }
+        outlet_anything(x->data_out, gensym("list"), n, a);
         return;
     }
     t_atom args[3];
@@ -649,8 +715,8 @@ static void witsensor_send_sensor_data_from_snapshot(t_witsensor *x, const t_que
         outlet_anything(x->data_out, gensym("gyro"), 3, args);
     }
     if (snap->use_timestamp) {
-        SETFLOAT(&args[0], (t_float)snap->ts_hi);
-        SETFLOAT(&args[1], (t_float)snap->ts_lo);
+        SETFLOAT(&args[0], (t_float)ts_sec);
+        SETFLOAT(&args[1], (t_float)ts_ms);
         outlet_anything(x->data_out, gensym("timestamp"), 2, args);
         SETFLOAT(&args[0], 0);
         SETFLOAT(&args[1], 0);
@@ -726,10 +792,8 @@ static void witsensor_pd_output_handler(t_pd *obj, void *data) {
         outlet_anything(x->data_out, out->msg, out->argc, out->argv);
     } else if (out->msg == gensym("quat")) {
         witsensor_send_quaternion_data(x);
-    } else if (out->msg == gensym("version1")) {
-        outlet_anything(x->status_out, out->msg, out->argc, out->argv);
-    } else if (out->msg == gensym("version2")) {
-        outlet_anything(x->status_out, out->msg, out->argc, out->argv);
+    } else if (out->msg == gensym("version_combined") && out->argc >= 2) {
+        outlet_anything(x->status_out, gensym("version"), 2, out->argv);
     } else if (out->msg == gensym("rate") || out->msg == gensym("bandwidth") || out->msg == gensym("axis") || out->msg == gensym("outputmode")) {
         outlet_anything(x->status_out, out->msg, out->argc, out->argv);
     }
@@ -781,6 +845,10 @@ void witsensor_pd_connected_handler(t_pd *obj, void *data) {
 
 // Scan for WIT devices (continuous until stopped or connected)
 static void witsensor_scan_devices(t_witsensor *x) {
+    if (x->is_connected) {
+        pd_error(x, "witsensor: already connected; disconnect first to scan for devices");
+        return;
+    }
     post("witsensor: scanning for BLE devices...");
     if (!x->ble_data) { post("witsensor: BLE not initialized"); return; }
     
@@ -815,8 +883,6 @@ static void witsensor_connect(t_witsensor *x, t_symbol *s, int argc, t_atom *arg
         x->device_name[0] = '\0';
     }
     
-    post("witsensor: connecting to device: %s", x->device_name);
-    
     // If already connected, do nothing to avoid surprising implicit disconnects
     if (x->is_connected) {
         post("witsensor: already connected; disconnect first to connect to a new device");
@@ -844,43 +910,10 @@ static void witsensor_connect(t_witsensor *x, t_symbol *s, int argc, t_atom *arg
         
         if (connected) {
             x->is_connected = 1;
-            // Clear pending autoconnect since we achieved a connection
             x->pending_target = NULL;
+            x->poll_interval = 0;
             t_atom a; SETFLOAT(&a, 1);
             outlet_anything(x->status_out, gensym("connected"), 1, &a);
-            // On-connect configuration: set desired streaming/output mode consistently for Pd usage
-            unsigned char cmd_unlock[] = {0xFF, 0xAA, 0x69, 0x88, 0xB5};
-            witsensor_ble_simpleble_write_data(x->ble_data, cmd_unlock, sizeof(cmd_unlock));
-            // Axis: 9-axis (reg 0x24, code 0x00)
-            unsigned char cmd_axis9[] = {0xFF, 0xAA, 0x24, 0x00, 0x00};
-            witsensor_ble_simpleble_write_data(x->ble_data, cmd_axis9, sizeof(cmd_axis9));
-            x->axis_mode = 9;
-            t_atom ax; SETFLOAT(&ax, 9);
-            outlet_anything(x->status_out, gensym("axis"), 1, &ax);
-            // Output mode (AGPVSEL, reg 0x96): 0 = accel+gyro+angle
-            unsigned char cmd_outmode0[] = {0xFF, 0xAA, 0x96, 0x00, 0x00};
-            witsensor_ble_simpleble_write_data(x->ble_data, cmd_outmode0, sizeof(cmd_outmode0));
-            x->output_mode = 0;
-            t_atom om; SETFLOAT(&om, 0);
-            outlet_anything(x->status_out, gensym("outputmode"), 1, &om);
-            // Default stream rate 50 Hz
-            unsigned char cmd_rate[] = {0xFF, 0xAA, 0x03, 0x08, 0x00};
-            witsensor_ble_simpleble_write_data(x->ble_data, cmd_rate, sizeof(cmd_rate));
-            t_atom rate_args[2];
-            SETFLOAT(&rate_args[0], 50.0f);
-            SETFLOAT(&rate_args[1], 0x08);
-            outlet_anything(x->status_out, gensym("rate"), 2, rate_args);
-             // bandwidth 256 Hz
-            unsigned char cmd_bw[] = {0xFF, 0xAA, 0x1F, 0x00, 0x00};
-            witsensor_ble_simpleble_write_data(x->ble_data, cmd_bw, sizeof(cmd_bw));
-            t_atom bw; SETFLOAT(&bw, 256.0f);
-            outlet_anything(x->status_out, gensym("bandwidth"), 1, &bw);
-            x->poll_interval = 0;
-            // Query current state so status reflects device registers (rate, bandwidth, axis, outputmode)
-            witsensor_read_rate(x);
-            witsensor_read_bandwidth(x);
-            witsensor_read_axis(x);
-            witsensor_read_outputmode(x);
         } else {
             post("witsensor: starting autoconnect...");
             x->pending_target = gensym(x->device_name[0] ? x->device_name : "*");
@@ -937,11 +970,6 @@ static void witsensor_set_rate(t_witsensor *x, t_float rate) {
 
     unsigned char cmd_rate[] = {0xFF, 0xAA, 0x03, rate_code, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_rate, sizeof(cmd_rate));
-
-    t_atom args[2];
-    SETFLOAT(&args[0], rate);
-    SETFLOAT(&args[1], rate_code);
-    outlet_anything(x->status_out, gensym("rate"), 2, args);
 }
 
 // Set digital filter bandwidth (register 0x1F)
@@ -959,10 +987,6 @@ static void witsensor_set_bandwidth(t_witsensor *x, t_float hz) {
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_unlock, sizeof(cmd_unlock));
     unsigned char cmd_bw[] = {0xFF, 0xAA, 0x1F, bw_code, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_bw, sizeof(cmd_bw));
-    
-    static const float bw_hz[] = { 256.0f, 188.0f, 98.0f, 42.0f, 20.0f, 10.0f, 5.0f };
-    t_atom a; SETFLOAT(&a, (t_float)bw_hz[bw_code]);
-    outlet_anything(x->status_out, gensym("bandwidth"), 1, &a);
 }
 
 // Returns 1 if connected and BLE ready; otherwise posts and returns 0. Safe for x==NULL.
@@ -1012,26 +1036,56 @@ static void witsensor_quat(t_witsensor *x) {
     witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
 }
 
-// Read firmware version registers 0x2E and 0x2F
-static void witsensor_read_version(t_witsensor *x) {
-    if (!witsensor_ensure_connected(x)) return;
-    unsigned char cmd1[] = {0xFF, 0xAA, 0x27, 0x2E, 0x00};
-    unsigned char cmd2[] = {0xFF, 0xAA, 0x27, 0x2F, 0x00};
-    witsensor_ble_simpleble_write_data(x->ble_data, cmd1, sizeof(cmd1));
-    witsensor_ble_simpleble_write_data(x->ble_data, cmd2, sizeof(cmd2));
+// Clock callback: send next register read (replaces usleep to avoid blocking Pd scheduler)
+static void witsensor_staged_read_tick(t_witsensor *x) {
+    if (!x || !x->ble_data || !witsensor_ble_simpleble_is_connected(x->ble_data)) return;
+    if (x->staged_read_type == STAGED_READ_VERSION && x->staged_read_step == 0) {
+        unsigned char cmd2[] = {0xFF, 0xAA, 0x27, 0x2F, 0x00};
+        witsensor_ble_simpleble_write_data(x->ble_data, cmd2, sizeof(cmd2));
+        x->staged_read_type = STAGED_READ_NONE;
+        return;
+    }
+    if (x->staged_read_type == STAGED_READ_TIME) {
+        if (x->staged_read_step == 0) {
+            unsigned char c31[] = {0xFF, 0xAA, 0x27, 0x31, 0x00};
+            witsensor_ble_simpleble_write_data(x->ble_data, c31, sizeof(c31));
+            x->staged_read_step = 1;
+            clock_delay(x->staged_read_clock, 30);
+        } else if (x->staged_read_step == 1) {
+            unsigned char c32[] = {0xFF, 0xAA, 0x27, 0x32, 0x00};
+            witsensor_ble_simpleble_write_data(x->ble_data, c32, sizeof(c32));
+            x->staged_read_step = 2;
+            clock_delay(x->staged_read_clock, 30);
+        } else if (x->staged_read_step == 2) {
+            unsigned char c33[] = {0xFF, 0xAA, 0x27, 0x33, 0x00};
+            witsensor_ble_simpleble_write_data(x->ble_data, c33, sizeof(c33));
+            x->staged_read_type = STAGED_READ_NONE;
+        }
+    }
 }
 
-// Read device time registers 0x30..0x33
+// Read firmware version registers 0x2E and 0x2F (staged to avoid blocking Pd)
+static void witsensor_read_version(t_witsensor *x) {
+    if (!witsensor_ensure_connected(x)) return;
+    clock_unset(x->staged_read_clock);
+    x->version_buf_flags = 0;
+    unsigned char cmd1[] = {0xFF, 0xAA, 0x27, 0x2E, 0x00};
+    witsensor_ble_simpleble_write_data(x->ble_data, cmd1, sizeof(cmd1));
+    x->staged_read_type = STAGED_READ_VERSION;
+    x->staged_read_step = 0;
+    clock_delay(x->staged_read_clock, 30);
+}
+
+// Read device time registers 0x30..0x33 (staged to avoid blocking Pd)
 static void witsensor_read_time(t_witsensor *x) {
     if (!witsensor_ensure_connected(x)) return;
+    clock_unset(x->staged_read_clock);
+    x->time_buf_flags = 0;
     unsigned char c30[] = {0xFF, 0xAA, 0x27, 0x30, 0x00};
-    unsigned char c31[] = {0xFF, 0xAA, 0x27, 0x31, 0x00};
-    unsigned char c32[] = {0xFF, 0xAA, 0x27, 0x32, 0x00};
-    unsigned char c33[] = {0xFF, 0xAA, 0x27, 0x33, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, c30, sizeof(c30));
-    witsensor_ble_simpleble_write_data(x->ble_data, c31, sizeof(c31));
-    witsensor_ble_simpleble_write_data(x->ble_data, c32, sizeof(c32));
-    witsensor_ble_simpleble_write_data(x->ble_data, c33, sizeof(c33));
+    x->staged_read_type = STAGED_READ_TIME;
+    x->staged_read_step = 0;
+    clock_delay(x->staged_read_clock, 30);
 }
 
 static void witsensor_read_rate(t_witsensor *x) {
@@ -1052,16 +1106,6 @@ static void witsensor_read_axis(t_witsensor *x) {
 static void witsensor_read_outputmode(t_witsensor *x) {
     if (!witsensor_ensure_connected(x)) return;
     unsigned char cmd[] = {0xFF, 0xAA, 0x27, 0x96, 0x00};
-    witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
-}
-static void witsensor_read_orientation(t_witsensor *x) {
-    if (!witsensor_ensure_connected(x)) return;
-    unsigned char cmd[] = {0xFF, 0xAA, 0x27, 0x23, 0x00};
-    witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
-}
-static void witsensor_read_baud(t_witsensor *x) {
-    if (!witsensor_ensure_connected(x)) return;
-    unsigned char cmd[] = {0xFF, 0xAA, 0x27, 0x04, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
 }
 
@@ -1108,20 +1152,13 @@ static void witsensor_settime(t_witsensor *x, t_symbol *s, int argc, t_atom *arg
     unsigned char save[] = {0xFF, 0xAA, 0x00, 0x00, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, save, sizeof(save));
     post("witsensor: RTC set to %04d-%02d-%02d %02d:%02d:%02d.%03d", year, month, day, hour, min, sec, ms);
-    t_atom a[7];
-    SETFLOAT(&a[0], (t_float)year);
-    SETFLOAT(&a[1], (t_float)month);
-    SETFLOAT(&a[2], (t_float)day);
-    SETFLOAT(&a[3], (t_float)hour);
-    SETFLOAT(&a[4], (t_float)min);
-    SETFLOAT(&a[5], (t_float)sec);
-    SETFLOAT(&a[6], (t_float)ms);
-    outlet_anything(x->status_out, gensym("time"), 7, a);
 }
 
 // Clear cached scan results (Pd message: reset)
 static void witsensor_reset(t_witsensor *x) {
     if (!x || !x->ble_data) { post("witsensor: BLE not initialized"); return; }
+    clock_unset(x->staged_read_clock);
+    x->staged_read_type = STAGED_READ_NONE;
     // Stop scanning if active
     if (witsensor_ble_simpleble_is_scanning(x->ble_data)) {
         witsensor_ble_simpleble_stop_scanning(x->ble_data);
@@ -1158,8 +1195,6 @@ static void witsensor_set_output_mode(t_witsensor *x, t_float f) {
     unsigned char cmd[] = {0xFF, 0xAA, 0x96, (unsigned char)mode, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd, sizeof(cmd));
     x->output_mode = mode;
-    t_atom a; SETFLOAT(&a, mode);
-    outlet_anything(x->status_out, gensym("outputmode"), 1, &a);
     x->use_disp_speed = (mode & 1);
     x->use_timestamp = ((mode >> 1) & 1);
 }
@@ -1212,9 +1247,14 @@ static void witsensor_poll(t_witsensor *x, t_symbol *type, t_float interval) {
     // Stop current polling if interval is 0 or negative
     if (interval <= 0) {
         x->poll_interval = 0;
+        t_symbol *stopped_type = x->poll_type;  /* may be NULL if none was active */
         x->poll_type = NULL;
         clock_unset(x->poll_clock);
-        outlet_anything(x->status_out, gensym("poll"), 0, NULL);
+        t_atom args[3];
+        SETSYMBOL(&args[0], stopped_type ? stopped_type : type);
+        SETFLOAT(&args[1], 0);   /* 0 Hz */
+        SETFLOAT(&args[2], 0);   /* off */
+        outlet_anything(x->status_out, gensym("poll"), 3, args);
         return;
     }
     
@@ -1250,6 +1290,9 @@ static void *witsensor_new(void) {
     x->data_out = outlet_new(&x->x_obj, &s_anything);
     x->status_out = outlet_new(&x->x_obj, &s_float);
     x->poll_clock = clock_new(x, (t_method)witsensor_poll_tick);
+    x->staged_read_clock = clock_new(x, (t_method)witsensor_staged_read_tick);
+    x->staged_read_type = STAGED_READ_NONE;
+    x->staged_read_step = 0;
     
     x->is_connected = 0;
     x->is_scanning = 0;
@@ -1264,9 +1307,8 @@ static void *witsensor_new(void) {
     x->pending_target = NULL;
     x->seen_ids = NULL;
     x->seen_count = 0;
-    x->rtc_yymm = 0;
-    x->rtc_ddh = 0;
-    x->rtc_mmss = 0;
+    x->time_buf_flags = 0;
+    x->version_buf_flags = 0;
     
     // Initialize BLE data structure (adapter will be created on first scan)
     post("witsensor: initializing BLE system...");
@@ -1315,6 +1357,8 @@ static void witsensor_free(t_witsensor *x) {
         x->seen_ids = NULL;
         x->seen_count = 0;
     }
+    clock_unset(x->staged_read_clock);
+    clock_free(x->staged_read_clock);
     clock_free(x->poll_clock);
 }
 
@@ -1324,7 +1368,7 @@ static void witsensor_free(t_witsensor *x) {
 static void witsensor_set_cmd(t_witsensor *x, t_symbol *s, int argc, t_atom *argv) {
     (void)s;
     if (argc < 1) {
-        pd_error(x, "witsensor set: usage set <type> [value...]");
+        pd_error(x, "witsensor: usage 'set <type> [value...]'");
         return;
     }
     t_symbol *type = atom_getsymbol(argv + 0);
@@ -1337,7 +1381,7 @@ static void witsensor_set_cmd(t_witsensor *x, t_symbol *s, int argc, t_atom *arg
         return;
     }
     if (argc < 2) {
-        pd_error(x, "witsensor set: need value for %s", type->s_name);
+        pd_error(x, "witsensor: need value for %s", type->s_name);
         return;
     }
     t_float val = atom_getfloat(argv + 1);
@@ -1354,7 +1398,7 @@ static void witsensor_set_cmd(t_witsensor *x, t_symbol *s, int argc, t_atom *arg
     } else if (type == gensym("baud")) {
         witsensor_set_baud(x, val);
     } else {
-        pd_error(x, "witsensor set: unknown type '%s'", type->s_name);
+        pd_error(x, "witsensor: unknown type '%s'", type->s_name);
     }
 }
 
@@ -1362,7 +1406,7 @@ static void witsensor_set_cmd(t_witsensor *x, t_symbol *s, int argc, t_atom *arg
 static void witsensor_get_cmd(t_witsensor *x, t_symbol *s, int argc, t_atom *argv) {
     (void)s;
     if (argc < 1) {
-        pd_error(x, "witsensor get: usage get <type>");
+        pd_error(x, "witsensor: usage 'get <type>'");
         return;
     }
     t_symbol *type = atom_getsymbol(argv + 0);
@@ -1372,19 +1416,28 @@ static void witsensor_get_cmd(t_witsensor *x, t_symbol *s, int argc, t_atom *arg
         outlet_anything(x->status_out, gensym("name"), 1, &a);
         return;
     }
+    if (type == gensym("address")) {
+        t_atom a;
+        char addr[64];  /* UUID on macOS = 36 chars; MAC on Windows = 17 chars */
+        if (x->ble_data && witsensor_ble_simpleble_get_connected_address(x->ble_data, addr, sizeof(addr))) {
+            SETSYMBOL(&a, gensym(addr));
+        } else {
+            SETSYMBOL(&a, gensym(""));
+        }
+        outlet_anything(x->status_out, gensym("address"), 1, &a);
+        return;
+    }
     if (type == gensym("rate")) { witsensor_read_rate(x); return; }
     if (type == gensym("bandwidth")) { witsensor_read_bandwidth(x); return; }
     if (type == gensym("axis")) { witsensor_read_axis(x); return; }
     if (type == gensym("outputmode")) { witsensor_read_outputmode(x); return; }
-    if (type == gensym("orientation")) { witsensor_read_orientation(x); return; }
     if (type == gensym("version")) { witsensor_read_version(x); return; }
     if (type == gensym("time")) { witsensor_read_time(x); return; }
     if (type == gensym("battery")) { witsensor_battery(x); return; }
     if (type == gensym("temp")) { witsensor_temp(x); return; }
     if (type == gensym("mag")) { witsensor_mag(x); return; }
     if (type == gensym("quat")) { witsensor_quat(x); return; }
-    if (type == gensym("baud")) { witsensor_read_baud(x); return; }
-    pd_error(x, "witsensor get: unknown type '%s'", type->s_name);
+    pd_error(x, "witsensor: unknown type '%s'", type->s_name);
 }
 
 // Calibration: calibrate (default=accel), calibrate 1 (mag), calibrate 2 (mag complete)
@@ -1412,8 +1465,6 @@ static void witsensor_axis(t_witsensor *x, t_float axis_count) {
     unsigned char cmd_algo[] = {0xFF, 0xAA, 0x24, code, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_algo, sizeof(cmd_algo));
     x->axis_mode = (axis_count == 9 ? 9 : 6);
-    t_atom a; SETFLOAT(&a, x->axis_mode);
-    outlet_anything(x->status_out, gensym("axis"), 1, &a);
 }
 
 static void witsensor_magcal_start(t_witsensor *x) {

@@ -360,8 +360,6 @@ void witsensor_ble_simpleble_clear_scan_results(witsensor_ble_simpleble_t *ble_d
 // Connect to a device by target string (address or identifier)
 int witsensor_ble_simpleble_connect(witsensor_ble_simpleble_t *ble_data, const char *target) {
     if (!ble_data || !target) return 0;
-    post("WITSensorBLE: Connecting to target: %s", target);
-
     // Ensure BLE is initialized
     if (!witsensor_ble_simpleble_ensure_initialized(ble_data)) {
         post("WITSensorBLE: Failed to initialize BLE system");
@@ -398,7 +396,6 @@ int witsensor_ble_simpleble_connect(witsensor_ble_simpleble_t *ble_data, const c
         if (!is_match && id && strcmp(id, target) == 0) is_match = 1;
 
         if (is_match) {
-            post("WITSensorBLE: Attempting connect to %s", target);
             if (simpleble_peripheral_connect(p) == SIMPLEBLE_SUCCESS) {
                 ble_data->peripheral = p;
                 ble_data->is_connected = 1;
@@ -406,14 +403,12 @@ int witsensor_ble_simpleble_connect(witsensor_ble_simpleble_t *ble_data, const c
                 if (ble_data->is_scanning) {
                     simpleble_adapter_scan_stop(ble_data->adapter);
                     ble_data->is_scanning = 0;
-                    post("WITSensorBLE: Stopped scanning after successful connection");
                 }
 
                 simpleble_uuid_t service_uuid = {.value = WIT_SERVICE_UUID_STR};
                 simpleble_uuid_t read_characteristic_uuid = {.value = WIT_READ_CHARACTERISTIC_UUID_STR};
                 simpleble_peripheral_notify(p, service_uuid, read_characteristic_uuid, simpleble_on_data_received, ble_data);
                 simpleble_peripheral_set_callback_on_disconnected(p, simpleble_on_disconnected, ble_data);
-                post("WITSensorBLE: Connected to %s", target);
                 if (addr) simpleble_free(addr);
                 if (id) simpleble_free(id);
                 return 1;
@@ -504,6 +499,17 @@ int witsensor_ble_simpleble_is_connected(witsensor_ble_simpleble_t *ble_data) {
 int witsensor_ble_simpleble_is_scanning(witsensor_ble_simpleble_t *ble_data) {
     if (!ble_data) return 0;
     return ble_data->is_scanning;
+}
+
+// Get connected device's BLE address
+int witsensor_ble_simpleble_get_connected_address(witsensor_ble_simpleble_t *ble_data, char *buf, size_t bufsize) {
+    if (!ble_data || !buf || bufsize < 2) return 0;
+    if (!ble_data->is_connected || !ble_data->peripheral) return 0;
+    char *addr = simpleble_peripheral_address(ble_data->peripheral);
+    if (!addr) return 0;
+    snprintf(buf, bufsize, "%s", addr);
+    simpleble_free(addr);
+    return 1;
 }
 
 // Permission probe: short bounded scan and count devices
