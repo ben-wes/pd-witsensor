@@ -9,8 +9,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h>
-#include <time.h>
 
 // Platform-specific includes
 #ifndef _WIN32
@@ -24,8 +22,8 @@
 #include "witsensor_ble_simpleble.h"
 
 #define WITSENSOR_MAJOR_VERSION 0
-#define WITSENSOR_MINOR_VERSION 3
-#define WITSENSOR_BUGFIX_VERSION 3
+#define WITSENSOR_MINOR_VERSION 4
+#define WITSENSOR_BUGFIX_VERSION 0
 
 #define MAX_DEVICES 20
 #define PACKET_SIZE 20
@@ -1050,8 +1048,8 @@ static void witsensor_disconnect(t_witsensor *x) {
 }
 
 // Set streaming rate (in Hz)
-// compact 0 = separate disp/speed/accel/gyro/timestamp/angle; compact 1 = one list
-static void witsensor_compact(t_witsensor *x, t_floatarg f) {
+// listmode 0 = separate messages per group; listmode 1 = one list
+static void witsensor_listmode(t_witsensor *x, t_floatarg f) {
     x->stream_compact = (f != 0) ? 1 : 0;
 }
 
@@ -1722,7 +1720,7 @@ void witsensor_setup(void) {
     class_addmethod(witsensor_class, (t_method)witsensor_connect, gensym("connect"), A_GIMME, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_disconnect, gensym("disconnect"), 0);
     class_addmethod(witsensor_class, (t_method)witsensor_poll, gensym("poll"), A_SYMBOL, A_DEFFLOAT, 0);
-    class_addmethod(witsensor_class, (t_method)witsensor_compact, gensym("compact"), A_DEFFLOAT, 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_listmode, gensym("listmode"), A_DEFFLOAT, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_dejitter, gensym("dejitter"), A_DEFFLOAT, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_set_cmd, gensym("set"), A_GIMME, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_get_cmd, gensym("get"), A_GIMME, 0);
