@@ -4,11 +4,6 @@ lib.name = witsensor
 # Helper variables for Makefile string manipulation
 space := $(subst ,, )
 
-# Pure Data path (use newer version)
-PD_PATH = /Applications/Pd-0.56-1.app/Contents/Resources/src
-# Allow overriding via environment; default to PD_PATH
-PDINCLUDEDIR ?= $(PD_PATH)
-
 # source files
 witsensor.class.sources = pd-witsensor-ble.c witsensor_ble_simpleble.c
 
