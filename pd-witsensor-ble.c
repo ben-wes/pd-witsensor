@@ -110,6 +110,7 @@ typedef struct _witsensor {
     t_dejitter_node *dejitter_head;
     t_dejitter_node *dejitter_tail;
     int dejitter_count;
+    int dejitter_debug;
     
     // BLE specific
     witsensor_ble_simpleble_t *ble_data;
@@ -803,6 +804,11 @@ static void witsensor_dejitter_tick(t_witsensor *x) {
         witsensor_send_sensor_data_from_snapshot(x, node->snap);
         free(node->snap);
         free(node);
+        if (x->dejitter_debug) {
+            t_atom a;
+            SETFLOAT(&a, (t_float)x->dejitter_count);
+            outlet_anything(x->status_out, gensym("queue"), 1, &a);
+        }
     }
     if (!x->stream_dejitter) {
         x->dejitter_clock_running = 0;
@@ -1051,6 +1057,10 @@ static void witsensor_disconnect(t_witsensor *x) {
 // listmode 0 = separate messages per group; listmode 1 = one list
 static void witsensor_listmode(t_witsensor *x, t_floatarg f) {
     x->stream_compact = (f != 0) ? 1 : 0;
+}
+
+static void witsensor_debug_queue(t_witsensor *x, t_floatarg f) {
+    x->dejitter_debug = (f != 0) ? 1 : 0;
 }
 
 // dejitter <0|1> - buffer streaming and output at sensor rate
@@ -1523,6 +1533,7 @@ static void *witsensor_new(void) {
     x->dejitter_last_data_time = 0;
     x->dejitter_head = x->dejitter_tail = NULL;
     x->dejitter_count = 0;
+    x->dejitter_debug = 0;
     
     return (void *)x;
 }
@@ -1722,6 +1733,7 @@ void witsensor_setup(void) {
     class_addmethod(witsensor_class, (t_method)witsensor_poll, gensym("poll"), A_SYMBOL, A_DEFFLOAT, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_listmode, gensym("listmode"), A_DEFFLOAT, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_dejitter, gensym("dejitter"), A_DEFFLOAT, 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_debug_queue, gensym("debug-queue"), A_DEFFLOAT, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_set_cmd, gensym("set"), A_GIMME, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_get_cmd, gensym("get"), A_GIMME, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_calibrate, gensym("calibrate"), 0);
