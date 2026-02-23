@@ -379,7 +379,7 @@ int witsensor_ble_simpleble_connect(witsensor_ble_simpleble_t *ble_data, const c
         }
     }
     if (!in_cached) {
-        pd_error(ble_data->pd_obj, "WITSensorBLE: Target not in cached results; start scan to populate results before connecting");
+        post("witsensor: target not in cached results, scanning...");
         return 0;
     }
 
