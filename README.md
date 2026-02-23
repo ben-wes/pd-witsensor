@@ -2,6 +2,8 @@
 
 for WitMotion WT9011DCL-BT50 sensor
 
+![witsensor-help.pd screenshot](witsensor-help.pd.png)
+
 ### Build
 
 ```bash
