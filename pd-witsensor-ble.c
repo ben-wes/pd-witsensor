@@ -41,6 +41,7 @@
 /* Forward: streaming snapshot and de-jitter queue node (full defs after t_queued_streaming) */
 typedef struct _queued_streaming t_queued_streaming;
 typedef struct _dejitter_node t_dejitter_node;
+typedef struct _poll_dejitter_node t_poll_dejitter_node;
 struct _dejitter_node {
     t_queued_streaming *snap;
     struct _dejitter_node *next;
@@ -89,10 +90,14 @@ typedef struct _witsensor {
     t_outlet *data_out;
     t_outlet *status_out;
     
-    // Clock for polling
+    // Polling: constant clock fires at poll rate; responses queued and output dejittered
     t_clock *poll_clock;
+    t_clock *poll_dejitter_clock;
     t_float poll_interval;
-    t_symbol *poll_type;  // "quat", "mag", "battery", "temp", etc.
+    t_symbol *poll_type;  // "quat", "mag", "battery", "temp"
+    t_poll_dejitter_node *poll_dejitter_head;
+    t_poll_dejitter_node *poll_dejitter_tail;
+    int poll_dejitter_count;
 
     // Staged multi-register reads
     t_clock *staged_read_clock;
@@ -152,6 +157,8 @@ static void witsensor_process_register_response(t_witsensor *x, unsigned char *d
 static void witsensor_process_streaming_data(t_witsensor *x, unsigned char *data, int length);
 static void witsensor_send_quaternion_data(t_witsensor *x);
 static void witsensor_poll_tick(t_witsensor *x);
+static void witsensor_poll_dejitter_tick(t_witsensor *x);
+static void witsensor_pd_poll_queue_handler(t_pd *obj, void *data);
 static void witsensor_dejitter_tick(t_witsensor *x);
 static void witsensor_battery(t_witsensor *x);
 static void witsensor_temp(t_witsensor *x);
@@ -180,6 +187,26 @@ typedef struct _queued_output {
     int argc; 
     t_atom argv[4]; 
 } t_queued_output;
+typedef struct _poll_dejitter_node {
+    t_symbol *msg;
+    int argc;
+    t_atom argv[4];
+    struct _poll_dejitter_node *next;
+} t_poll_dejitter_node;
+#define MAX_POLL_DEJITTER_QUEUE 32
+#define POLL_DEJITTER_CATCHUP 1   /* output 2 per tick when queue exceeds this */
+
+static void witsensor_poll_dejitter_clear(t_witsensor *x) {
+    clock_unset(x->poll_dejitter_clock);
+    while (x->poll_dejitter_head) {
+        t_poll_dejitter_node *node = x->poll_dejitter_head;
+        x->poll_dejitter_head = node->next;
+        free(node);
+    }
+    x->poll_dejitter_tail = NULL;
+    x->poll_dejitter_count = 0;
+}
+
 typedef struct _queued_datetime {
     int year, month, day, hour, min, sec, ms;
 } t_queued_datetime;
@@ -286,14 +313,16 @@ static void witsensor_process_register_response(t_witsensor *x, unsigned char *d
         else if (vraw >= 340) pct = 5;
         else pct = 0;
         
-        // Queue the output for Pd thread (thread-safe)
         t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
         if (out) {
             out->msg = gensym("battery");
             out->argc = 2;
             SETFLOAT(&out->argv[0], volts);
             SETFLOAT(&out->argv[1], (t_float)pct);
-            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+            if (x->poll_interval > 0 && x->poll_type == gensym("battery"))
+                pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_poll_queue_handler);
+            else
+                pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
         }
         return;
     }
@@ -302,13 +331,15 @@ static void witsensor_process_register_response(t_witsensor *x, unsigned char *d
         uint16_t traw = (uint16_t)(data[4] | (data[5] << 8));
         float degC = (float)((int16_t)traw) / 100;
         
-        // Queue the output for Pd thread (thread-safe)
         t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
         if (out) {
             out->msg = gensym("temp");
             out->argc = 1;
             SETFLOAT(&out->argv[0], (t_float)degC);
-            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+            if (x->poll_interval > 0 && x->poll_type == gensym("temp"))
+                pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_poll_queue_handler);
+            else
+                pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
         }
         return;
     }
@@ -318,7 +349,6 @@ static void witsensor_process_register_response(t_witsensor *x, unsigned char *d
         int16_t my = (int16_t)((data[7] << 8) | data[6]);
         int16_t mz = (int16_t)((data[9] << 8) | data[8]);
         
-        // Queue the output for Pd thread (thread-safe)
         t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
         if (out) {
             out->msg = gensym("mag");
@@ -326,7 +356,10 @@ static void witsensor_process_register_response(t_witsensor *x, unsigned char *d
             SETFLOAT(&out->argv[0], (t_float)((float)mx / 150));
             SETFLOAT(&out->argv[1], (t_float)((float)my / 150));
             SETFLOAT(&out->argv[2], (t_float)((float)mz / 150));
-            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+            if (x->poll_interval > 0 && x->poll_type == gensym("mag"))
+                pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_poll_queue_handler);
+            else
+                pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
         }
         return;
     }
@@ -337,18 +370,23 @@ static void witsensor_process_register_response(t_witsensor *x, unsigned char *d
         int16_t q2 = (int16_t)((data[9] << 8) | data[8]);
         int16_t q3 = (int16_t)((data[11] << 8) | data[10]);
         
-        // Store in object (thread-safe for simple assignments)
         x->quat_w = (float)q0 / 32768;
         x->quat_x = (float)q1 / 32768;
         x->quat_y = (float)q2 / 32768;
         x->quat_z = (float)q3 / 32768;
         
-        // Queue the output for Pd thread (thread-safe)
         t_queued_output *out = (t_queued_output *)malloc(sizeof(t_queued_output));
         if (out) {
             out->msg = gensym("quat");
-            out->argc = 0;
-            pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
+            out->argc = 4;
+            SETFLOAT(&out->argv[0], (t_float)x->quat_w);
+            SETFLOAT(&out->argv[1], (t_float)x->quat_x);
+            SETFLOAT(&out->argv[2], (t_float)x->quat_y);
+            SETFLOAT(&out->argv[3], (t_float)x->quat_z);
+            if (x->poll_interval > 0 && x->poll_type == gensym("quat"))
+                pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_poll_queue_handler);
+            else
+                pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_output_handler);
         }
         return;
     }
@@ -894,42 +932,75 @@ static void witsensor_dejitter_tick(t_witsensor *x) {
     clock_delay(x->dejitter_clock, interval);
 }
 
-// Function for polling requests (battery/temp/mag/quat)
-static void witsensor_poll_tick(t_witsensor *x) {
-    if (!x || !x->ble_data) {
-        post("witsensor: ERROR - Invalid object or BLE data");
-        return;
+/* Poll queue handler: add response to dejitter queue; outputs at even intervals */
+static void witsensor_pd_poll_queue_handler(t_pd *obj, void *data) {
+    if (!obj || !data) return;
+    t_witsensor *x = (t_witsensor *)obj;
+    t_queued_output *out = (t_queued_output *)data;
+    if (x->poll_dejitter_count >= MAX_POLL_DEJITTER_QUEUE) {
+        t_poll_dejitter_node *old = x->poll_dejitter_head;
+        if (old) {
+            x->poll_dejitter_head = old->next;
+            if (!x->poll_dejitter_head) x->poll_dejitter_tail = NULL;
+            x->poll_dejitter_count--;
+            free(old);
+        }
     }
-    
-    // Check connection status
+    t_poll_dejitter_node *node = (t_poll_dejitter_node *)malloc(sizeof(t_poll_dejitter_node));
+    if (!node) { free(out); return; }
+    node->msg = out->msg;
+    node->argc = out->argc;
+    for (int i = 0; i < out->argc && i < 4; i++) node->argv[i] = out->argv[i];
+    node->next = NULL;
+    free(out);
+    if (x->poll_dejitter_tail)
+        x->poll_dejitter_tail->next = node;
+    else
+        x->poll_dejitter_head = node;
+    x->poll_dejitter_tail = node;
+    x->poll_dejitter_count++;
+    if (x->poll_dejitter_count == 1)
+        clock_delay(x->poll_dejitter_clock, x->poll_interval);
+}
+
+static void witsensor_poll_dejitter_tick(t_witsensor *x) {
+    if (!x) return;
+    if (x->poll_dejitter_head) {
+        t_poll_dejitter_node *node = x->poll_dejitter_head;
+        x->poll_dejitter_head = node->next;
+        if (!x->poll_dejitter_head) x->poll_dejitter_tail = NULL;
+        x->poll_dejitter_count--;
+        t_outlet *dest = (node->msg == gensym("quat") || node->msg == gensym("mag"))
+            ? x->data_out : x->status_out;
+        outlet_anything(dest, node->msg, node->argc, node->argv);
+        free(node);
+    }
+    if (x->poll_dejitter_count > 0) {
+        /* When backlog, tick slightly faster to drain; keeps spacing even (no 0ms bursts) */
+        t_float next = (x->poll_dejitter_count > POLL_DEJITTER_CATCHUP)
+            ? x->poll_interval * 0.9f : x->poll_interval;
+        if (next < 1) next = 1;
+        clock_delay(x->poll_dejitter_clock, next);
+    }
+}
+
+static void witsensor_poll_tick(t_witsensor *x) {
+    if (!x || !x->ble_data) return;
     x->is_connected = witsensor_ble_simpleble_is_connected(x->ble_data);
     x->is_scanning = witsensor_ble_simpleble_is_scanning(x->ble_data);
 
-    // Only poll if connected and interval is set
     if (x->poll_interval > 0 && x->is_connected && x->poll_type) {
-        if (x->poll_type == gensym("all")) {
-            witsensor_battery(x);
-            witsensor_temp(x);
-            witsensor_mag(x);
-            witsensor_quat(x);
-            witsensor_read_version(x);
-        } else if (x->poll_type == gensym("quat")) {
-            witsensor_quat(x);
-        } else if (x->poll_type == gensym("mag")) {
-            witsensor_mag(x);
-        } else if (x->poll_type == gensym("battery")) {
-            witsensor_battery(x);
-        } else if (x->poll_type == gensym("temp")) {
-            witsensor_temp(x);
-        }
-        
-        // Schedule next poll
+        if (x->poll_type == gensym("quat")) witsensor_quat(x);
+        else if (x->poll_type == gensym("mag")) witsensor_mag(x);
+        else if (x->poll_type == gensym("battery")) witsensor_battery(x);
+        else if (x->poll_type == gensym("temp")) witsensor_temp(x);
         clock_delay(x->poll_clock, x->poll_interval);
     } else if (x->poll_interval > 0 && !x->is_connected) {
-        // Stop polling when disconnected
-        post("witsensor: disconnected, stopping %s polling", x->poll_type ? x->poll_type->s_name : "unknown");
+        post("witsensor: disconnected, stopping polling");
         x->poll_interval = 0;
         x->poll_type = NULL;
+        clock_unset(x->poll_clock);
+        witsensor_poll_dejitter_clear(x);
     }
 }
 
@@ -940,6 +1011,7 @@ static void witsensor_pd_output_handler(t_pd *obj, void *data) {
     t_queued_output *out = (t_queued_output *)data;
 
     if (out->msg == gensym("quat")) {
+        /* One-shot get: use x (argc may be 0 or 4 depending on path) */
         witsensor_send_quaternion_data(x);
     } else if (out->msg == gensym("version_combined") && out->argc >= 3) {
         int major = (int)atom_getfloat(out->argv + 0);
@@ -998,10 +1070,11 @@ void witsensor_pd_connected_handler(t_pd *obj, void *data) {
         witsensor_query_config(x);
     } else {
         if (x->poll_interval > 0) {
-            post("witsensor: device disconnected, stopping %s polling", 
-                 x->poll_type ? x->poll_type->s_name : "unknown");
+            post("witsensor: device disconnected, stopping polling");
             x->poll_interval = 0;
             x->poll_type = NULL;
+            clock_unset(x->poll_clock);
+            witsensor_poll_dejitter_clear(x);
         }
     }
     
@@ -1077,6 +1150,9 @@ static void witsensor_connect(t_witsensor *x, t_symbol *s, int argc, t_atom *arg
             x->is_connected = 1;
             x->pending_target = NULL;
             x->poll_interval = 0;
+            x->poll_type = NULL;
+            clock_unset(x->poll_clock);
+            witsensor_poll_dejitter_clear(x);
             witsensor_query_config(x);
             t_atom a; SETFLOAT(&a, 1);
             outlet_anything(x->status_out, gensym("connected"), 1, &a);
@@ -1523,49 +1599,43 @@ static void witsensor_restore(t_witsensor *x) {
 }
 
 // Unified polling method: poll <type> <rate-hz>
-// Examples: poll quat 10, poll all 5, poll mag 5, poll battery 1, poll temp 2
-// "all" = battery, temp, mag, quat, version each interval (like app recording row)
+// One type at a time (sensor handles only one pending query)
+// Examples: poll quat 10, poll mag 5, poll battery 1, poll temp 2, poll quat 0 (stop)
 static void witsensor_poll(t_witsensor *x, t_symbol *type, t_float rate_hz) {
-    if (!type) {
-        post("witsensor: poll requires a type (quat, mag, battery, temp, all)");
+    if (!type || (type != gensym("quat") && type != gensym("mag") &&
+        type != gensym("battery") && type != gensym("temp"))) {
+        post("witsensor: poll type must be one of: quat, mag, battery, temp");
         return;
     }
-    
-    if (type != gensym("quat") && type != gensym("mag") && 
-        type != gensym("battery") && type != gensym("temp") && type != gensym("all")) {
-        post("witsensor: poll type must be one of: quat, mag, battery, temp, all");
-        return;
-    }
-    
-    // Stop current polling if rate is 0 or negative
+
+    t_atom args[3];
+    SETSYMBOL(&args[0], type);
+
     if (rate_hz <= 0) {
         x->poll_interval = 0;
-        t_symbol *stopped_type = x->poll_type;  /* may be NULL if none was active */
         x->poll_type = NULL;
         clock_unset(x->poll_clock);
-        t_atom args[3];
-        SETSYMBOL(&args[0], stopped_type ? stopped_type : type);
-        SETFLOAT(&args[1], 0);   /* 0 Hz */
-        SETFLOAT(&args[2], 0);   /* off */
+        witsensor_poll_dejitter_clear(x);
+        SETFLOAT(&args[1], 0);
+        SETFLOAT(&args[2], 0);
         outlet_anything(x->status_out, gensym("poll"), 3, args);
         return;
     }
-    
+
     int period_ms = (int)(1000 / rate_hz);
     if (period_ms < 1) period_ms = 1;
-    
-    x->poll_interval = period_ms;
+
+    x->poll_interval = (t_float)period_ms;
     x->poll_type = type;
-    
-    if (x->is_connected) {
+
+    if (x->is_connected && x->ble_data && witsensor_ble_simpleble_is_connected(x->ble_data)) {
         clock_unset(x->poll_clock);
         clock_delay(x->poll_clock, x->poll_interval);
-        t_atom args[3];
-        SETSYMBOL(&args[0], type);
-        SETFLOAT(&args[1], 1000 / x->poll_interval);
-        SETFLOAT(&args[2], x->poll_interval);
-        outlet_anything(x->status_out, gensym("poll"), 3, args);
     }
+
+    SETFLOAT(&args[1], 1000.f / period_ms);
+    SETFLOAT(&args[2], (t_float)period_ms);
+    outlet_anything(x->status_out, gensym("poll"), 3, args);
 }
 
 // Constructor
@@ -1584,6 +1654,9 @@ static void *witsensor_new(t_symbol *s, int argc, t_atom *argv) {
     x->data_out = outlet_new(&x->x_obj, &s_anything);
     x->status_out = outlet_new(&x->x_obj, &s_float);
     x->poll_clock = clock_new(x, (t_method)witsensor_poll_tick);
+    x->poll_dejitter_clock = clock_new(x, (t_method)witsensor_poll_dejitter_tick);
+    x->poll_dejitter_head = x->poll_dejitter_tail = NULL;
+    x->poll_dejitter_count = 0;
     x->staged_read_clock = clock_new(x, (t_method)witsensor_staged_read_tick);
     x->staged_read_type = STAGED_READ_NONE;
     x->staged_read_step = 0;
@@ -1682,6 +1755,9 @@ static void witsensor_free(t_witsensor *x) {
     clock_unset(x->dejitter_clock);
     clock_free(x->staged_read_clock);
     clock_free(x->dejitter_clock);
+    witsensor_poll_dejitter_clear(x);
+    clock_free(x->poll_dejitter_clock);
+    clock_unset(x->poll_clock);
     clock_free(x->poll_clock);
     /* Flush dejitter queue */
     while (x->dejitter_head) {
