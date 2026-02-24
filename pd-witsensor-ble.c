@@ -789,7 +789,7 @@ static void witsensor_send_sensor_data_from_snapshot(t_witsensor *x, const t_que
     if (snap->use_timestamp) {
         SETFLOAT(&args[0], (t_float)ts_sec);
         SETFLOAT(&args[1], (t_float)ts_ms);
-        outlet_anything(x->data_out, gensym("timestamp"), 2, args);
+        outlet_anything(x->data_out, gensym("ts"), 2, args);
         SETFLOAT(&args[0], 0);
         SETFLOAT(&args[1], 0);
         SETFLOAT(&args[2], snap->angle_z);
