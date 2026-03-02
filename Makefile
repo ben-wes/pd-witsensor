@@ -5,7 +5,8 @@ lib.name = witsensor
 space := $(subst ,, )
 
 # source files
-witsensor.class.sources = pd-witsensor-ble.c witsensor_ble_simpleble.c
+witsensor.class.sources = witsensor.c witsensor_ble_simpleble.c
+witmotion.class.sources = witmotion.c
 
 # include directories (use submodule SimpleBLE C API)
 # Add export include paths for both static (macOS) and shared (Linux) builds.
@@ -39,6 +40,7 @@ endef
 datafiles = \
 	README.md \
 	witsensor-help.pd \
+	witmotion-help.pd \
 	${empty}
 
 # include pd-lib-builder

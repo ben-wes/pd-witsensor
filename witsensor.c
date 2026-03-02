@@ -1,4 +1,4 @@
-/* pd-witsensor-ble.c
+/* witsensor.c
  * PureData external for WIT BWT901BLE5.0 sensor with BLE support
  * based on simpleBLE library
  * 

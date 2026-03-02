@@ -150,7 +150,7 @@ jobs:
             /I"${pdDir}/src" `
             /O2 /W3 /LD /MD `
             /DPD_FLOATSIZE=${{ matrix.floatsize }} `
-            pd-witsensor-ble.c witsensor_ble_simpleble.c `
+            witsensor.c witsensor_ble_simpleble.c `
             /link /DLL "/OUT:${outFile}" `
             "/LIBPATH:${pdDir}/bin" $pdLib `
             "SimpleBLE/simplecble/build-windows/lib/Release/simpleble.lib" `

@@ -16,9 +16,12 @@ make deps && make
 
 ```
 [witsensor]
+[witmotion]
 ```
 
-Open help patch for extensive documentation
+**witsensor** – BLE client for WitMotion sensor (accel, gyro, etc.). Open help patch for extensive documentation.
+
+**witmotion** – IMU motion processor: inlet `[ax ay az gx gy gz]` or accel/gyro (3 floats each). Mag via separate `mag` message (slower rate OK). Outputs quat, accdyn, speed. Madgwick AHRS (IMU + optional mag).
 
 ### License
 
