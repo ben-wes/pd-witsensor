@@ -6,7 +6,9 @@ space := $(subst ,, )
 
 # source files
 witsensor.class.sources = witsensor.c witsensor_ble_simpleble.c
-witmotion.class.sources = witmotion.c
+witmagic.class.sources = witmagic.c
+svfbp~.class.sources = svfbp~.c
+vcfx~.class.sources = vcfx~.c
 
 # include directories (use submodule SimpleBLE C API)
 # Add export include paths for both static (macOS) and shared (Linux) builds.
@@ -14,7 +16,7 @@ witmotion.class.sources = witmotion.c
 cflags = -I. -I./SimpleBLE/simplecble/include -I./SimpleBLE/simpleble/include -I./SimpleBLE/simplecble/build-static/export -I./SimpleBLE/simplecble/build/export
 
 # libraries
-ldlibs = -lpthread
+ldlibs = -lpthread -lm
 
 # platform-specific settings - SimpleBLE for all platforms
 define forDarwin
@@ -40,7 +42,8 @@ endef
 datafiles = \
 	README.md \
 	witsensor-help.pd \
-	witmotion-help.pd \
+	witmagic-help.pd \
+	vcfx~-help.pd \
 	${empty}
 
 # include pd-lib-builder
