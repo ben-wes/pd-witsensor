@@ -48,6 +48,11 @@ struct _dejitter_node {
 };
 #define MAX_DEJITTER_QUEUE 64
 #define DEJITTER_BLE_BURST_HZ 25      /* assumed BLE connection-interval rate */
+
+/* Scaling per WIT protocol: accel /32768*16 → g; gyro /32768*2000 → °/s; mag LSB /150 → µT */
+#define ACCEL_SCALE  (16.f / 32768.f)
+#define GYRO_SCALE   (2000.f / 32768.f)
+#define MAG_SCALE    (1.f / 150.f)
 #define DEJITTER_BUFFER_BURSTS 0.5    /* target buffer depth = fraction of one burst */
 #define DEJITTER_SMOOTH_ALPHA 0.005    /* IIR smoothing on queue depth (time constant ~100 ticks) */
 #define DEJITTER_DRIFT_GAIN_FAST 0.001f  /* correct quickly when queue is draining (prevent underrun) */
@@ -344,7 +349,7 @@ static void witsensor_process_register_response(t_witsensor *x, unsigned char *d
         return;
     }
     if (start == 0x3A && length >= 10) {
-        // Magnetic field: three words; convert to uT via /150
+        /* Mag: LSB → µT (per common conversion). Witmotion normalizes internally. */
         int16_t mx = (int16_t)((data[5] << 8) | data[4]);
         int16_t my = (int16_t)((data[7] << 8) | data[6]);
         int16_t mz = (int16_t)((data[9] << 8) | data[8]);
@@ -353,9 +358,9 @@ static void witsensor_process_register_response(t_witsensor *x, unsigned char *d
         if (out) {
             out->msg = gensym("mag");
             out->argc = 3;
-            SETFLOAT(&out->argv[0], (t_float)((float)mx / 150));
-            SETFLOAT(&out->argv[1], (t_float)((float)my / 150));
-            SETFLOAT(&out->argv[2], (t_float)((float)mz / 150));
+            SETFLOAT(&out->argv[0], (t_float)((float)mx * MAG_SCALE));
+            SETFLOAT(&out->argv[1], (t_float)((float)my * MAG_SCALE));
+            SETFLOAT(&out->argv[2], (t_float)((float)mz * MAG_SCALE));
             if (x->poll_interval > 0 && x->poll_type == gensym("mag"))
                 pd_queue_mess(x->pd_instance, (t_pd *)x, out, witsensor_pd_poll_queue_handler);
             else
@@ -709,12 +714,14 @@ static void witsensor_process_streaming_data(t_witsensor *x, unsigned char *data
         x->speed_y = (float)i4;
         x->speed_z = (float)i5;
     } else {
-        x->accel_x = (float)i0 / 32768 * 16;
-        x->accel_y = (float)i1 / 32768 * 16;
-        x->accel_z = (float)i2 / 32768 * 16;
-        x->gyro_x = (float)i3 / 32768 * 2000;
-        x->gyro_y = (float)i4 / 32768 * 2000;
-        x->gyro_z = (float)i5 / 32768 * 2000;
+        /* Accel: g (per protocol AX/32768*16g). Witmotion expects g. */
+        x->accel_x = (float)i0 * ACCEL_SCALE;
+        x->accel_y = (float)i1 * ACCEL_SCALE;
+        x->accel_z = (float)i2 * ACCEL_SCALE;
+        /* Gyro: °/s (per protocol GX/32768*2000). Witmotion expects °/s. */
+        x->gyro_x = (float)i3 * GYRO_SCALE;
+        x->gyro_y = (float)i4 * GYRO_SCALE;
+        x->gyro_z = (float)i5 * GYRO_SCALE;
     }
     if (x->use_timestamp) {
         // Timestamp in ms: 32-bit little-endian composed from two int16 words
@@ -1879,21 +1886,21 @@ static void witsensor_set_axis(t_witsensor *x, t_float axis_count) {
     outlet_anything(x->status_out, gensym("axis"), 1, &a);
 }
 
-static void witsensor_magcal_start(t_witsensor *x) {
+static void witsensor_magcal(t_witsensor *x, t_floatarg f) {
     if (!witsensor_ensure_connected(x)) return;
-    unsigned char cmd_unlock[] = {0xFF, 0xAA, 0x69, 0x88, 0xB5};
-    witsensor_ble_simpleble_write_data(x->ble_data, cmd_unlock, sizeof(cmd_unlock));
-    unsigned char cmd_start[] = {0xFF, 0xAA, 0x01, 0x07, 0x00};
-    witsensor_ble_simpleble_write_data(x->ble_data, cmd_start, sizeof(cmd_start));
-    t_atom a; SETSYMBOL(&a, gensym("start"));
-    outlet_anything(x->status_out, gensym("magcal"), 1, &a);
-}
-
-static void witsensor_magcal_stop(t_witsensor *x) {
-    if (!witsensor_ensure_connected(x)) return;
-    unsigned char cmd_stop[] = {0xFF, 0xAA, 0x01, 0x00, 0x00};
-    witsensor_ble_simpleble_write_data(x->ble_data, cmd_stop, sizeof(cmd_stop));
-    t_atom a; SETSYMBOL(&a, gensym("stop"));
+    int start = (f != 0) ? 1 : 0;
+    if (start) {
+        unsigned char cmd_unlock[] = {0xFF, 0xAA, 0x69, 0x88, 0xB5};
+        witsensor_ble_simpleble_write_data(x->ble_data, cmd_unlock, sizeof(cmd_unlock));
+        unsigned char cmd_start[] = {0xFF, 0xAA, 0x01, 0x07, 0x00};
+        witsensor_ble_simpleble_write_data(x->ble_data, cmd_start, sizeof(cmd_start));
+    } else {
+        unsigned char cmd_stop[] = {0xFF, 0xAA, 0x01, 0x00, 0x00};
+        witsensor_ble_simpleble_write_data(x->ble_data, cmd_stop, sizeof(cmd_stop));
+        unsigned char cmd_save[] = {0xFF, 0xAA, 0x00, 0x00, 0x00};
+        witsensor_ble_simpleble_write_data(x->ble_data, cmd_save, sizeof(cmd_save));
+    }
+    t_atom a; SETFLOAT(&a, (t_float)start);
     outlet_anything(x->status_out, gensym("magcal"), 1, &a);
 }
 
@@ -1901,8 +1908,6 @@ static void witsensor_zzero(t_witsensor *x) {
     if (!witsensor_ensure_connected(x)) return;
     unsigned char cmd_unlock[] = {0xFF, 0xAA, 0x69, 0x88, 0xB5};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_unlock, sizeof(cmd_unlock));
-    unsigned char cmd_algo6[] = {0xFF, 0xAA, 0x24, 0x01, 0x00};
-    witsensor_ble_simpleble_write_data(x->ble_data, cmd_algo6, sizeof(cmd_algo6));
     unsigned char cmd_zeroz[] = {0xFF, 0xAA, 0x01, 0x04, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_zeroz, sizeof(cmd_zeroz));
     outlet_anything(x->status_out, gensym("zzero"), 0, NULL);
@@ -1939,8 +1944,7 @@ void witsensor_setup(void) {
     class_addmethod(witsensor_class, (t_method)witsensor_set_cmd, gensym("set"), A_GIMME, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_get_cmd, gensym("get"), A_GIMME, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_calibrate, gensym("calibrate"), 0);
-    class_addmethod(witsensor_class, (t_method)witsensor_magcal_start, gensym("magcal-start"), 0);
-    class_addmethod(witsensor_class, (t_method)witsensor_magcal_stop, gensym("magcal-stop"), 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_magcal, gensym("magcal"), A_DEFFLOAT, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_xyzero, gensym("xyzero"), 0);
     class_addmethod(witsensor_class, (t_method)witsensor_zzero, gensym("zzero"), 0);
     class_addmethod(witsensor_class, (t_method)witsensor_version, gensym("about"), 0);
