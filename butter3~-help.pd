@@ -1,0 +1,15 @@
+#N canvas 0 0 450 320 12;
+#X text 20 20 butter3~ — 3rd order Butterworth lowpass (multichannel);
+#X text 20 45 [butter3~] or [butter3~ freq] — default 100 Hz. Channels from audio inlet;
+#X text 20 70 Inlets: signal \, cutoff Hz (cold). Both multichannel \, wrap if C < N;
+#X text 20 95 Outlet: filtered signal \, N channels;
+#X obj 50 120 butter3~;
+#X obj 50 160 noise~;
+#X obj 50 200 sig~ 100;
+#X obj 200 160 output~;
+#X connect 1 0 0 0;
+#X connect 2 0 0 1;
+#X connect 0 0 4 0;
+#X text 55 105 signal;
+#X text 55 145 freq;
+#X text 205 145 out;

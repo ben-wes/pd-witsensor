@@ -9,6 +9,7 @@ witsensor.class.sources = witsensor.c witsensor_ble_simpleble.c
 witmagic.class.sources = witmagic.c
 svfbp~.class.sources = svfbp~.c
 vcfx~.class.sources = vcfx~.c
+butter3~.class.sources = butter3~.c
 
 # include directories (use submodule SimpleBLE C API)
 # Add export include paths for both static (macOS) and shared (Linux) builds.
@@ -44,6 +45,8 @@ datafiles = \
 	witsensor-help.pd \
 	witmagic-help.pd \
 	vcfx~-help.pd \
+	svfbp~-help.pd \
+	butter3~-help.pd \
 	${empty}
 
 # include pd-lib-builder
