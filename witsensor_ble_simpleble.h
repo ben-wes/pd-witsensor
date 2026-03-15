@@ -37,12 +37,7 @@ typedef struct witsensor_ble_simpleble_t {
     // Pd instance pointer for pd_queue_mess marshaling
     void *pd_instance;
 
-    // Cached scan results for GUI-thread-safe enumeration
-    char **cached_ids;
-    char **cached_addrs;
-    unsigned long cached_count;
-
-    // Debug/state
+    // Debug/state (adapter holds scan results; we don't duplicate)
     int scan_found_count;
     char adapter_id[128];
     char adapter_addr[64];
@@ -54,7 +49,13 @@ void witsensor_ble_simpleble_destroy(witsensor_ble_simpleble_t *ble_data);
 void witsensor_ble_simpleble_start_scanning(witsensor_ble_simpleble_t *ble_data);
 void witsensor_ble_simpleble_stop_scanning(witsensor_ble_simpleble_t *ble_data);
 void witsensor_ble_simpleble_get_scan_results(witsensor_ble_simpleble_t *ble_data);
+// Log scan results to post (for scan_complete handler)
+void witsensor_ble_simpleble_log_scan_results(witsensor_ble_simpleble_t *ble_data);
 void witsensor_ble_simpleble_clear_scan_results(witsensor_ble_simpleble_t *ble_data);
+// Get first free (not connected) WIT device ID from adapter (for no-arg connect). Returns 1 if found.
+int witsensor_ble_simpleble_get_first_wit_id(witsensor_ble_simpleble_t *ble_data, char *buf, size_t bufsize);
+// Returns 1 if device with given id is already connected (to any instance).
+int witsensor_ble_simpleble_is_device_connected(witsensor_ble_simpleble_t *ble_data, const char *id);
 int witsensor_ble_simpleble_connect(witsensor_ble_simpleble_t *ble_data, const char *target);
 void witsensor_ble_simpleble_disconnect(witsensor_ble_simpleble_t *ble_data);
 int witsensor_ble_simpleble_write_data(witsensor_ble_simpleble_t *ble_data, const unsigned char *data, int length);

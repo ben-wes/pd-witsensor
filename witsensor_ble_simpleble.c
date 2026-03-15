@@ -9,6 +9,7 @@
 
 #include "witsensor_ble_simpleble.h"
 #include "m_pd.h"
+#include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -28,7 +29,7 @@
 extern void witsensor_pd_scan_complete_handler(t_pd *obj, void *data);
 // Forward declarations for Pd-thread status handlers and payloads
 typedef struct _queued_flag { int value; } t_queued_flag;
-typedef struct _queued_device { char *tag; char *addr; char *id; } t_queued_device;
+typedef struct _queued_device { char *tag; char *addr; char *id; int from_live_scan; } t_queued_device;
 void witsensor_pd_scanning_handler(t_pd *obj, void *data);
 void witsensor_pd_device_found_handler(t_pd *obj, void *data);
 void witsensor_pd_connected_handler(t_pd *obj, void *data);
@@ -47,75 +48,42 @@ static simpleble_uuid_t WIT_SERVICE_UUID = {.value = WIT_SERVICE_UUID_STR};
 static simpleble_uuid_t WIT_WRITE_CHARACTERISTIC_UUID = {.value = WIT_WRITE_CHARACTERISTIC_UUID_STR};
 static simpleble_uuid_t WIT_READ_CHARACTERISTIC_UUID = {.value = WIT_READ_CHARACTERISTIC_UUID_STR};
 
-// Forward declarations
+/* Serial scan: only one instance can own the scan at a time (SimpleBLE has one callback slot). */
+static witsensor_ble_simpleble_t *s_scan_owner = NULL;
 
-// Forward declare helpers used by macOS scan tasks
-static void _clear_cached_results(witsensor_ble_simpleble_t *ble);
-
-// Helper function to output scan results via status outlet
+// Output devices from adapter (single source of truth - no per-instance cache)
 static void _output_scan_results(witsensor_ble_simpleble_t *ble_data) {
     if (!ble_data || !ble_data->adapter) return;
-    // Output from cached snapshot so that 'clear' affects 'results'
-    unsigned long n = ble_data->cached_count;
-    for (unsigned long i = 0; i < n; i++) {
-        const char *addr = (ble_data->cached_addrs && ble_data->cached_addrs[i]) ? ble_data->cached_addrs[i] : NULL;
-        const char *id = (ble_data->cached_ids && ble_data->cached_ids[i]) ? ble_data->cached_ids[i] : NULL;
-        if (!id) continue;
-        const char *tag = (strstr(id, "WT") != NULL) ? "wit" : "other";
-        if (ble_data->pd_instance && ble_data->pd_obj) {
+    size_t n = simpleble_adapter_scan_get_results_count(ble_data->adapter);
+    for (size_t i = 0; i < n; i++) {
+        simpleble_peripheral_t p = simpleble_adapter_scan_get_results_handle(ble_data->adapter, i);
+        if (!p) continue;
+        char *addr = simpleble_peripheral_address(p);
+        char *id = simpleble_peripheral_identifier(p);
+        if (id && ble_data->pd_instance && ble_data->pd_obj) {
+            const char *tag = (strstr(id, "WT") != NULL) ? "wit" : "other";
             t_queued_device *d = (t_queued_device *)malloc(sizeof(t_queued_device));
             if (d) {
                 d->tag = strdup(tag);
                 d->addr = addr ? strdup(addr) : NULL;
                 d->id = strdup(id);
+                d->from_live_scan = 0;  /* from results dump */
                 pd_queue_mess((t_pdinstance*)ble_data->pd_instance, (t_pd*)ble_data->pd_obj, d, witsensor_pd_device_found_handler);
             }
         }
+        if (addr) simpleble_free(addr);
+        if (id) simpleble_free(id);
+        simpleble_peripheral_release_handle(p);
     }
-}
-
-// Helpers to manage cached scan results (CoreBluetooth thread safe: no Pd calls)
-static void _clear_cached_results(witsensor_ble_simpleble_t *ble) {
-    if (!ble) return;
-    ble->scan_found_count = 0;
-    ble->adapter_id[0] = '\0';
-    ble->adapter_addr[0] = '\0';
-    if (ble->cached_ids) {
-        for (unsigned long i = 0; i < ble->cached_count; i++) free(ble->cached_ids[i]);
-        free(ble->cached_ids);
-        ble->cached_ids = NULL;
-    }
-    if (ble->cached_addrs) {
-        for (unsigned long i = 0; i < ble->cached_count; i++) free(ble->cached_addrs[i]);
-        free(ble->cached_addrs);
-        ble->cached_addrs = NULL;
-    }
-    ble->cached_count = 0;
-}
-
-static void _append_cached_result(witsensor_ble_simpleble_t *ble, const char *id, const char *addr) {
-    if (!ble || !id || !addr) return;
-    if (!ble->is_scanning) return; // avoid races after stop
-    unsigned long n = ble->cached_count;
-    char **new_ids = (char**)realloc(ble->cached_ids, (n+1) * sizeof(char*));
-    char **new_addrs = (char**)realloc(ble->cached_addrs, (n+1) * sizeof(char*));
-    if (!new_ids || !new_addrs) {
-        // Allocation failed; keep old arrays
-        return;
-    }
-    ble->cached_ids = new_ids;
-    ble->cached_addrs = new_addrs;
-    ble->cached_ids[n] = strdup(id);
-    ble->cached_addrs[n] = strdup(addr);
-    ble->cached_count = n + 1;
 }
 
 // SimpleBLE scan callbacks
 static void simpleble_on_scan_start(simpleble_adapter_t adapter, void *user_data) {
     witsensor_ble_simpleble_t *ble_data = (witsensor_ble_simpleble_t *)user_data;
     if (!ble_data) return;
-    _clear_cached_results(ble_data);
-    // cache adapter id/addr for debug
+    ble_data->scan_found_count = 0;
+    ble_data->adapter_id[0] = '\0';
+    ble_data->adapter_addr[0] = '\0';
     char *aid = simpleble_adapter_identifier(adapter);
     char *aad = simpleble_adapter_address(adapter);
     if (aid) { snprintf(ble_data->adapter_id, sizeof(ble_data->adapter_id), "%s", aid); simpleble_free(aid); }
@@ -126,6 +94,7 @@ static void simpleble_on_scan_stop(simpleble_adapter_t adapter, void *user_data)
     (void)adapter;
     witsensor_ble_simpleble_t *ble_data = (witsensor_ble_simpleble_t *)user_data;
     if (!ble_data) return;
+    if (s_scan_owner == ble_data) s_scan_owner = NULL;
     ble_data->is_scanning = 0;
     // Emit scanning 0 via Pd thread
     if (ble_data->pd_instance && ble_data->pd_obj) {
@@ -139,22 +108,18 @@ static void simpleble_on_scan_found(simpleble_adapter_t adapter, simpleble_perip
     witsensor_ble_simpleble_t *ble_data = (witsensor_ble_simpleble_t *)user_data;
     if (!ble_data || !peripheral) return;
     if (ble_data->is_connected) return;
-    simpleble_peripheral_t p = peripheral;
-    char *addr = simpleble_peripheral_address(p);
-    char *id = simpleble_peripheral_identifier(p);
-    if (id && addr) {
-        _append_cached_result(ble_data, id, addr);
+    char *addr = simpleble_peripheral_address(peripheral);
+    char *id = simpleble_peripheral_identifier(peripheral);
+    if (id && ble_data->pd_instance && ble_data->pd_obj) {
         ble_data->scan_found_count++;
-        // Emit device status via Pd thread: device wit|other <id>
-        if (ble_data->pd_instance && ble_data->pd_obj) {
-            t_queued_device *d = (t_queued_device *)malloc(sizeof(t_queued_device));
-            if (d) {
-                const char *tag = (strstr(id, "WT") != NULL) ? "wit" : "other";
-                d->tag = strdup(tag);
-                d->addr = addr ? strdup(addr) : NULL;
-                d->id = id ? strdup(id) : NULL;
-                pd_queue_mess((t_pdinstance*)ble_data->pd_instance, (t_pd*)ble_data->pd_obj, d, witsensor_pd_device_found_handler);
-            }
+        const char *tag = (strstr(id, "WT") != NULL) ? "wit" : "other";
+        t_queued_device *d = (t_queued_device *)malloc(sizeof(t_queued_device));
+        if (d) {
+            d->tag = strdup(tag);
+            d->addr = addr ? strdup(addr) : NULL;
+            d->id = strdup(id);
+            d->from_live_scan = 1;  /* from scan_found; suppress if scan stopped */
+            pd_queue_mess((t_pdinstance*)ble_data->pd_instance, (t_pd*)ble_data->pd_obj, d, witsensor_pd_device_found_handler);
         }
     }
     if (addr) simpleble_free(addr);
@@ -205,45 +170,43 @@ witsensor_ble_simpleble_t *witsensor_ble_simpleble_create(void) {
     ble_data->peripheral = NULL;
     ble_data->is_scanning = 0;
     ble_data->is_connected = 0;
-    ble_data->cached_ids = NULL;
-    ble_data->cached_addrs = NULL;
-    ble_data->cached_count = 0;
-    
     return ble_data;
 }
 
 // Destroy BLE data structure - COMPLETELY CRASH-SAFE
 void witsensor_ble_simpleble_destroy(witsensor_ble_simpleble_t *ble_data) {
     if (ble_data) {
-        // Don't call SimpleBLE release functions - they might crash
-        // Just free the memory
-        if (ble_data->cached_ids) {
-            for (unsigned long i = 0; i < ble_data->cached_count; i++) free(ble_data->cached_ids[i]);
-            free(ble_data->cached_ids);
-        }
-        if (ble_data->cached_addrs) {
-            for (unsigned long i = 0; i < ble_data->cached_count; i++) free(ble_data->cached_addrs[i]);
-            free(ble_data->cached_addrs);
-        }
+        if (s_scan_owner == ble_data) s_scan_owner = NULL;
         free(ble_data);
     }
 }
 
-// Ensure BLE is initialized
+// Ensure BLE is initialized (adapter obtained when NULL, for connect/results)
 int witsensor_ble_simpleble_ensure_initialized(witsensor_ble_simpleble_t *ble_data) {
     if (!ble_data) return 0;
-    
-    // If already initialized, return success
-    if (ble_data->adapter) {
-        return 1;
-    }
+    if (ble_data->adapter) return 1;
 
+    size_t adapter_count = simpleble_adapter_get_count();
+    if (adapter_count == 0) return 0;
+    ble_data->adapter = simpleble_adapter_get_handle(0);
+    if (!ble_data->adapter) return 0;
+
+    simpleble_adapter_set_callback_on_scan_start(ble_data->adapter, simpleble_on_scan_start, ble_data);
+    simpleble_adapter_set_callback_on_scan_stop(ble_data->adapter, simpleble_on_scan_stop, ble_data);
+    simpleble_adapter_set_callback_on_scan_found(ble_data->adapter, simpleble_on_scan_found, ble_data);
     return 1;
 }
 
 // Start scanning for devices
 void witsensor_ble_simpleble_start_scanning(witsensor_ble_simpleble_t *ble_data) {
     if (!ble_data) return;
+
+    /* Serial scan: only one instance can own the scan (SimpleBLE has one callback slot).
+     * Warn and return if another instance is already scanning. */
+    if (s_scan_owner != NULL && s_scan_owner != ble_data) {
+        post("witsensor: another instance is already scanning - stop it first, or use 'connect <device_id>' with a known ID");
+        return;
+    }
     
     post("WITSensorBLE: Starting BLE scan ...");
     
@@ -274,7 +237,6 @@ void witsensor_ble_simpleble_start_scanning(witsensor_ble_simpleble_t *ble_data)
         
         post("WITSensorBLE: BLE adapter initialized successfully");
     }
-    _clear_cached_results(ble_data);
     
     // Check if Bluetooth is enabled before attempting scan
     if (!simpleble_adapter_is_bluetooth_enabled()) {
@@ -282,6 +244,7 @@ void witsensor_ble_simpleble_start_scanning(witsensor_ble_simpleble_t *ble_data)
         return;
     }
     
+    s_scan_owner = ble_data;
     ble_data->is_scanning = 1;
     // Emit scanning 1 via Pd thread
     if (ble_data->pd_instance && ble_data->pd_obj) {
@@ -291,6 +254,7 @@ void witsensor_ble_simpleble_start_scanning(witsensor_ble_simpleble_t *ble_data)
     // Non-blocking scan: start, and let 'results' query current list
     simpleble_err_t err = simpleble_adapter_scan_start(ble_data->adapter);
     if (err != SIMPLEBLE_SUCCESS) {
+        s_scan_owner = NULL;
         ble_data->is_scanning = 0;
         pd_error(ble_data->pd_obj, "WITSensorBLE: scan_start failed: %d", err);
         return;
@@ -311,6 +275,7 @@ void witsensor_ble_simpleble_stop_scanning(witsensor_ble_simpleble_t *ble_data) 
         return;
     }
     
+    if (s_scan_owner == ble_data) s_scan_owner = NULL;
     // Stop scanning
     simpleble_err_t err = simpleble_adapter_scan_stop(ble_data->adapter);
     if (err != SIMPLEBLE_SUCCESS) {
@@ -320,6 +285,27 @@ void witsensor_ble_simpleble_stop_scanning(witsensor_ble_simpleble_t *ble_data) 
     }
     
     ble_data->is_scanning = 0;
+}
+
+// Log scan results to post (for scan_complete)
+void witsensor_ble_simpleble_log_scan_results(witsensor_ble_simpleble_t *ble_data) {
+    if (!ble_data || !ble_data->adapter) return;
+    size_t n = simpleble_adapter_scan_get_results_count(ble_data->adapter);
+    if (n == 0) {
+        post("WITSensorBLE: Found 0 devices. Ensure Bluetooth is on and devices are advertising.");
+        return;
+    }
+    post("WITSensorBLE: Found %zu devices", n);
+    for (size_t i = 0; i < n; i++) {
+        simpleble_peripheral_t p = simpleble_adapter_scan_get_results_handle(ble_data->adapter, i);
+        if (!p) continue;
+        char *id = simpleble_peripheral_identifier(p);
+        char *addr = simpleble_peripheral_address(p);
+        if (id && addr) post("WITSensorBLE: Found device: %s [%s]", id, addr);
+        if (id) simpleble_free(id);
+        if (addr) simpleble_free(addr);
+        simpleble_peripheral_release_handle(p);
+    }
 }
 
 // Get scan results - GUI-safe
@@ -336,53 +322,72 @@ void witsensor_ble_simpleble_get_scan_results(witsensor_ble_simpleble_t *ble_dat
     _output_scan_results(ble_data);
 }
 
-// Clear scan results
+// Clear scan results - no-op (adapter holds results; clearing would affect all instances)
 void witsensor_ble_simpleble_clear_scan_results(witsensor_ble_simpleble_t *ble_data) {
-    if (!ble_data) return;
-    
-    // Free existing cached results
-    if (ble_data->cached_ids) {
-        for (unsigned long i = 0; i < ble_data->cached_count; i++) {
-            if (ble_data->cached_ids[i]) free(ble_data->cached_ids[i]);
-            if (ble_data->cached_addrs[i]) free(ble_data->cached_addrs[i]);
+    (void)ble_data;
+    post("witsensor: clear is a no-op (adapter holds scan results)");
+}
+
+// Get first free (not yet connected) WIT device ID from adapter (for no-arg connect)
+int witsensor_ble_simpleble_get_first_wit_id(witsensor_ble_simpleble_t *ble_data, char *buf, size_t bufsize) {
+    if (!ble_data || !buf || bufsize < 2) return 0;
+    if (!witsensor_ble_simpleble_ensure_initialized(ble_data)) return 0;
+    size_t n = simpleble_adapter_scan_get_results_count(ble_data->adapter);
+    for (size_t i = 0; i < n; i++) {
+        simpleble_peripheral_t p = simpleble_adapter_scan_get_results_handle(ble_data->adapter, i);
+        if (!p) continue;
+        char *id = simpleble_peripheral_identifier(p);
+        if (id && strstr(id, "WT") != NULL) {
+            bool already_connected = false;
+            if (simpleble_peripheral_is_connected(p, &already_connected) == SIMPLEBLE_SUCCESS && already_connected) {
+                if (id) simpleble_free(id);
+                simpleble_peripheral_release_handle(p);
+                continue;  /* skip, try next */
+            }
+            strncpy(buf, id, bufsize - 1);
+            buf[bufsize - 1] = '\0';
+            simpleble_free(id);
+            simpleble_peripheral_release_handle(p);
+            return 1;
         }
-        free(ble_data->cached_ids);
-        free(ble_data->cached_addrs);
-        ble_data->cached_ids = NULL;
-        ble_data->cached_addrs = NULL;
-        ble_data->cached_count = 0;
+        if (id) simpleble_free(id);
+        simpleble_peripheral_release_handle(p);
     }
-    
-    ble_data->scan_found_count = 0;
-    post("WITSensorBLE: Cleared scan results");
+    return 0;
+}
+
+// Returns 1 if device with given id is already connected (to any instance)
+int witsensor_ble_simpleble_is_device_connected(witsensor_ble_simpleble_t *ble_data, const char *id) {
+    if (!ble_data || !id || !ble_data->adapter) return 0;
+    size_t n = simpleble_adapter_scan_get_results_count(ble_data->adapter);
+    for (size_t i = 0; i < n; i++) {
+        simpleble_peripheral_t p = simpleble_adapter_scan_get_results_handle(ble_data->adapter, i);
+        if (!p) continue;
+        char *pid = simpleble_peripheral_identifier(p);
+        int match = (pid && strcmp(pid, id) == 0);
+        if (pid) simpleble_free(pid);
+        if (match) {
+            bool connected = false;
+            int ok = (simpleble_peripheral_is_connected(p, &connected) == SIMPLEBLE_SUCCESS && connected);
+            simpleble_peripheral_release_handle(p);
+            return ok ? 1 : 0;
+        }
+        simpleble_peripheral_release_handle(p);
+    }
+    return 0;
 }
 
 // Connect to a device by target string (address or identifier)
 int witsensor_ble_simpleble_connect(witsensor_ble_simpleble_t *ble_data, const char *target) {
     if (!ble_data || !target) return 0;
-    // Ensure BLE is initialized
+    // Ensure BLE is initialized (gets adapter when NULL)
     if (!witsensor_ble_simpleble_ensure_initialized(ble_data)) {
         post("WITSensorBLE: Failed to initialize BLE system");
         return 0;
     }
 
-    // Require that target exists in our cached results to honor 'reset'
-    int in_cached = 0;
-    if (ble_data->cached_ids && ble_data->cached_addrs && ble_data->cached_count > 0) {
-        for (unsigned long i = 0; i < ble_data->cached_count; i++) {
-            const char *cid = ble_data->cached_ids[i];
-            const char *caddr = ble_data->cached_addrs[i];
-            if ((cid && strcmp(cid, target) == 0) || (caddr && strcmp(caddr, target) == 0)) {
-                in_cached = 1;
-                break;
-            }
-        }
-    }
-    if (!in_cached) {
-        post("witsensor: target not in cached results, scanning...");
-        return 0;
-    }
-
+    /* Use adapter's scan results (shared across instances). Allows connect with
+     * explicit ID even when this instance didn't scan (e.g. another instance scanned). */
     size_t count = simpleble_adapter_scan_get_results_count(ble_data->adapter);
     for (size_t i = 0; i < count; i++) {
         simpleble_peripheral_t p = simpleble_adapter_scan_get_results_handle(ble_data->adapter, i);
@@ -396,9 +401,24 @@ int witsensor_ble_simpleble_connect(witsensor_ble_simpleble_t *ble_data, const c
         if (!is_match && id && strcmp(id, target) == 0) is_match = 1;
 
         if (is_match) {
+            bool already_connected = false;
+            if (simpleble_peripheral_is_connected(p, &already_connected) == SIMPLEBLE_SUCCESS && already_connected) {
+                if (ble_data->peripheral == p) {
+                    /* We already own this connection */
+                    if (addr) simpleble_free(addr);
+                    if (id) simpleble_free(id);
+                    return 1;
+                }
+                post("witsensor: %s already connected to another instance", target);
+                if (addr) simpleble_free(addr);
+                if (id) simpleble_free(id);
+                simpleble_peripheral_release_handle(p);
+                return 0;
+            }
             if (simpleble_peripheral_connect(p) == SIMPLEBLE_SUCCESS) {
                 ble_data->peripheral = p;
                 ble_data->is_connected = 1;
+                if (s_scan_owner == ble_data) s_scan_owner = NULL;
 
                 if (ble_data->is_scanning) {
                     simpleble_adapter_scan_stop(ble_data->adapter);
@@ -414,7 +434,10 @@ int witsensor_ble_simpleble_connect(witsensor_ble_simpleble_t *ble_data, const c
                 return 1;
             } else {
                 pd_error(ble_data->pd_obj, "WITSensorBLE: Failed to connect to %s", target);
+                simpleble_peripheral_release_handle(p);
             }
+        } else {
+            simpleble_peripheral_release_handle(p);
         }
 
         if (addr) simpleble_free(addr);

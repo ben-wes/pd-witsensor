@@ -140,9 +140,6 @@ typedef struct _witsensor {
     t_pdinstance *pd_instance;
     // Autoconnect state: pending_target == NULL → none, "*" → any WIT, else exact match
     t_symbol *pending_target;
-    // Dedupe device announcements per scan
-    char **seen_ids;
-    unsigned long seen_count;
     // Time read: buffer all four register responses (0x30..0x33) before building; they can arrive in any order
     uint16_t time_buf_yymm, time_buf_ddh, time_buf_mmss, time_buf_ms;
     uint8_t time_buf_flags;  /* 0x01=got 0x30, 0x02=0x31, 0x04=0x32, 0x08=0x33 */
@@ -154,7 +151,7 @@ typedef struct _witsensor {
 t_class *witsensor_class;
 
 // Forward declarations
-static void witsensor_scan_devices(t_witsensor *x);
+static void witsensor_scan_devices(t_witsensor *x, t_symbol *s, int argc, t_atom *argv);
 static void witsensor_get_scan_results(t_witsensor *x);
 static void witsensor_connect(t_witsensor *x, t_symbol *s, int argc, t_atom *argv);
 static void witsensor_disconnect(t_witsensor *x);
@@ -184,7 +181,6 @@ static void witsensor_set_rate(t_witsensor *x, t_float rate);
 static void witsensor_set_bandwidth(t_witsensor *x, t_float hz);
 static void witsensor_set_axis(t_witsensor *x, t_float axis_count);
 static void witsensor_set_output_mode(t_witsensor *x, t_floatarg mode);
-static void witsensor_reset(t_witsensor *x);
 static int witsensor_ensure_connected(t_witsensor *x);
 // pd_queue_mess marshaling
 typedef struct _queued_output { 
@@ -234,7 +230,7 @@ static void witsensor_ble_data_callback(void *user_data, unsigned char *data, in
 void witsensor_pd_scan_complete_handler(t_pd *obj, void *data);
 // New Pd-thread handlers for status output
 typedef struct _queued_flag { int value; } t_queued_flag;
-typedef struct _queued_device { char *tag; char *addr; char *id; } t_queued_device;
+typedef struct _queued_device { char *tag; char *addr; char *id; int from_live_scan; } t_queued_device;
 void witsensor_pd_scanning_handler(t_pd *obj, void *data);
 void witsensor_pd_device_found_handler(t_pd *obj, void *data);
 void witsensor_pd_connected_handler(t_pd *obj, void *data);
@@ -596,17 +592,7 @@ void witsensor_pd_scan_complete_handler(t_pd *obj, void *data) {
     if (x->ble_data->scan_found_count > 0) {
         post("WITSensorBLE: Devices seen via callbacks: %d", x->ble_data->scan_found_count);
     }
-    unsigned long n = x->ble_data->cached_count;
-    if (n == 0) {
-        post("WITSensorBLE: Found 0 devices. Ensure Bluetooth is on and devices are advertising.");
-        return;
-    }
-    post("WITSensorBLE: Found %lu devices", n);
-    for (unsigned long i = 0; i < n; i++) {
-        const char *id = x->ble_data->cached_ids ? x->ble_data->cached_ids[i] : NULL;
-        const char *addr = x->ble_data->cached_addrs ? x->ble_data->cached_addrs[i] : NULL;
-        if (id && addr) post("WITSensorBLE: Found device: %s [%s]", id, addr);
-    }
+    witsensor_ble_simpleble_log_scan_results(x->ble_data);
 }
 
 // Emit scanning status on Pd thread
@@ -628,22 +614,11 @@ void witsensor_pd_device_found_handler(t_pd *obj, void *data) {
     t_queued_device *d = (t_queued_device *)data;
     if (!d) return;
     if (!x || x->is_connected) goto cleanup;
-    // Dedupe in current session
-    if (d->id) {
-        int seen = 0;
-        for (unsigned long i = 0; i < x->seen_count; i++) {
-            if (x->seen_ids && x->seen_ids[i] && strcmp(x->seen_ids[i], d->id) == 0) { seen = 1; break; }
-        }
-        if (!seen) {
-            char **new_ids = (char**)realloc(x->seen_ids, (x->seen_count + 1) * sizeof(char*));
-            if (new_ids) {
-                x->seen_ids = new_ids;
-                x->seen_ids[x->seen_count] = strdup(d->id);
-                x->seen_count++;
-            }
-        }
-    }
-    if (x->pending_target && !x->is_connected && x->is_scanning) {
+    /* Suppress live-scan devices if scan was stopped (queued callbacks can arrive after scan 0) */
+    if (d->from_live_scan && (!x->ble_data || !witsensor_ble_simpleble_is_scanning(x->ble_data)))
+        goto cleanup;
+    /* Autoconnect only for live-scan discoveries; "results" dump must not trigger connect */
+    if (d->from_live_scan && x->pending_target && !x->is_connected && x->is_scanning) {
         int should_connect = 0;
         const char *target = x->pending_target->s_name;
         if (target && target[0] && strcmp(target, "*") != 0) {
@@ -651,8 +626,9 @@ void witsensor_pd_device_found_handler(t_pd *obj, void *data) {
                 should_connect = 1;
             }
         } else if (target && strcmp(target, "*") == 0) {
-            if (d->tag && strcmp(d->tag, "wit") == 0) {
-                should_connect = 1;
+            if (d->tag && strcmp(d->tag, "wit") == 0
+                && !witsensor_ble_simpleble_is_device_connected(x->ble_data, d->id)) {
+                should_connect = 1;  /* next free sensor */
             }
         }
         if (should_connect && d->id) {
@@ -1088,27 +1064,27 @@ void witsensor_pd_connected_handler(t_pd *obj, void *data) {
     free(flag);
 }
 
-// Scan for WIT devices (continuous until stopped or connected)
-static void witsensor_scan_devices(t_witsensor *x) {
-    if (x->is_connected) {
-        pd_error(x, "witsensor: already connected; disconnect first to scan for devices");
-        return;
+// Scan for WIT devices: scan, scan 1 = start; scan 0 = stop (continuous until stopped or connected)
+static void witsensor_scan_devices(t_witsensor *x, t_symbol *s, int argc, t_atom *argv) {
+    (void)s;
+    int do_scan = 1;  /* default: start */
+    if (argc >= 1 && argv[0].a_type == A_FLOAT)
+        do_scan = (atom_getfloat(argv) != 0) ? 1 : 0;
+
+    if (do_scan) {
+        if (x->is_connected) {
+            pd_error(x, "witsensor: cannot scan while connected (SimpleBLE clears device list on scan start); disconnect first");
+            return;
+        }
+        post("witsensor: scanning for BLE devices...");
+        if (!x->ble_data) { post("witsensor: BLE not initialized"); return; }
+        witsensor_ble_simpleble_start_scanning(x->ble_data);
+    } else {
+        if (!x->ble_data) { post("witsensor: BLE not initialized"); return; }
+        if (witsensor_ble_simpleble_is_scanning(x->ble_data)) {
+            witsensor_ble_simpleble_stop_scanning(x->ble_data);
+        }
     }
-    post("witsensor: scanning for BLE devices...");
-    if (!x->ble_data) { post("witsensor: BLE not initialized"); return; }
-    
-    // Reset scan results list
-    witsensor_ble_simpleble_clear_scan_results(x->ble_data);
-    // Reset dedupe list
-    if (x->seen_ids) {
-        for (unsigned long i = 0; i < x->seen_count; i++) free(x->seen_ids[i]);
-        free(x->seen_ids);
-        x->seen_ids = NULL;
-        x->seen_count = 0;
-    }
-    
-    // Continuous scanning (no timeout needed)
-    witsensor_ble_simpleble_start_scanning(x->ble_data);
 }
 
 // Get scan results
@@ -1138,19 +1114,11 @@ static void witsensor_connect(t_witsensor *x, t_symbol *s, int argc, t_atom *arg
     if (x->ble_data) {
         int connected = 0;
         if (x->device_name[0]) {
-            // Try immediate targeted connect
             connected = witsensor_ble_simpleble_connect(x->ble_data, x->device_name);
         } else {
-            // No target specified: try current cached results for first WIT device
-            if (x->ble_data->cached_ids && x->ble_data->cached_count > 0) {
-                for (unsigned long i = 0; i < x->ble_data->cached_count; i++) {
-                    const char *id = x->ble_data->cached_ids[i];
-                    if (id && strstr(id, "WT") != NULL) {
-                        connected = witsensor_ble_simpleble_connect(x->ble_data, id);
-                        if (connected) break;
-                    }
-                }
-            }
+            char first_id[64];
+            if (witsensor_ble_simpleble_get_first_wit_id(x->ble_data, first_id, sizeof(first_id)))
+                connected = witsensor_ble_simpleble_connect(x->ble_data, first_id);
         }
         
         if (connected) {
@@ -1187,6 +1155,7 @@ static void witsensor_disconnect(t_witsensor *x) {
         // Cancel any pending autoconnect so subsequent 'results' won't reconnect implicitly
         x->pending_target = NULL;
         witsensor_ble_simpleble_disconnect(x->ble_data);
+        x->is_connected = 0;  /* sync Pd-level state so connect/scan work on retry */
         x->should_stop = 1;
     }
 }
@@ -1515,34 +1484,6 @@ static void witsensor_set_name(t_witsensor *x, t_symbol *s, int argc, t_atom *ar
     }
 }
 
-// Clear cached scan results (Pd message: reset)
-static void witsensor_reset(t_witsensor *x) {
-    if (!x || !x->ble_data) { post("witsensor: BLE not initialized"); return; }
-    clock_unset(x->staged_read_clock);
-    clock_unset(x->dejitter_clock);
-    x->dejitter_clock_running = 0;
-    x->staged_read_type = STAGED_READ_NONE;
-    while (x->dejitter_head) {
-        t_dejitter_node *node = x->dejitter_head;
-        x->dejitter_head = node->next;
-        free(node->snap);
-        free(node);
-    }
-    x->dejitter_tail = NULL;
-    x->dejitter_count = 0;
-    // Stop scanning if active
-    if (witsensor_ble_simpleble_is_scanning(x->ble_data)) {
-        witsensor_ble_simpleble_stop_scanning(x->ble_data);
-    }
-    witsensor_ble_simpleble_clear_scan_results(x->ble_data);
-    if (x->seen_ids) {
-        for (unsigned long i = 0; i < x->seen_count; i++) free(x->seen_ids[i]);
-        free(x->seen_ids);
-        x->seen_ids = NULL;
-        x->seen_count = 0;
-    }
-}
-
 // Set angle reference (zero): FF AA 01 08 00
 static void witsensor_xyzero(t_witsensor *x) {
     if (!witsensor_ensure_connected(x)) return;
@@ -1682,8 +1623,6 @@ static void *witsensor_new(t_symbol *s, int argc, t_atom *argv) {
     x->temp_bytes_count = 0;
     x->pd_instance = pd_this;
     x->pending_target = NULL;
-    x->seen_ids = NULL;
-    x->seen_count = 0;
     x->time_buf_flags = 0;
     x->version_buf_flags = 0;
     
@@ -1750,13 +1689,6 @@ static void witsensor_free(t_witsensor *x) {
     pd_queue_cancel((t_pd *)x);
     if (x->ble_data) {
         witsensor_ble_simpleble_destroy(x->ble_data);
-    }
-    // Free dedupe list
-    if (x->seen_ids) {
-        for (unsigned long i = 0; i < x->seen_count; i++) free(x->seen_ids[i]);
-        free(x->seen_ids);
-        x->seen_ids = NULL;
-        x->seen_count = 0;
     }
     clock_unset(x->staged_read_clock);
     clock_unset(x->dejitter_clock);
@@ -1933,7 +1865,7 @@ void witsensor_setup(void) {
                                CLASS_DEFAULT,
                                A_GIMME, 0);
     
-    class_addmethod(witsensor_class, (t_method)witsensor_scan_devices, gensym("scan"), 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_scan_devices, gensym("scan"), A_GIMME, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_get_scan_results, gensym("results"), 0);
     class_addmethod(witsensor_class, (t_method)witsensor_connect, gensym("connect"), A_GIMME, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_disconnect, gensym("disconnect"), 0);
@@ -1949,7 +1881,6 @@ void witsensor_setup(void) {
     class_addmethod(witsensor_class, (t_method)witsensor_zzero, gensym("zzero"), 0);
     class_addmethod(witsensor_class, (t_method)witsensor_version, gensym("about"), 0);
     class_addmethod(witsensor_class, (t_method)witsensor_restore, gensym("restore"), 0);
-    class_addmethod(witsensor_class, (t_method)witsensor_reset, gensym("reset"), 0);
     
     witsensor_version();
 }

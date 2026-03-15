@@ -1017,9 +1017,9 @@
 #X msg 81 151 connect WT901BLE67;
 #X msg 80 210 disconnect;
 #X text 150 210 disconnect device;
-#X text 116 33 scan for bluetooth devices. devices are output on the status outlet during discovery, f 44;
-#X text 134 85 (re-)output or clear current result list;
-#X msg 80 95 reset;
+#X text 116 33 scan (or scan 1) = start, scan 0 = stop. devices on status outlet during discovery, f 44;
+#X text 134 85 (re-)output current result list;
+#X msg 80 95 scan 0;
 #X obj 41 247 s \$0-in;
 #X msg 81 172 connect;
 #X text 353 129 connect via address;
@@ -1360,7 +1360,7 @@
 #X text 44 192 acclin (1G);
 #X obj 214 35 hsl 136 16 0 1 0 0 empty empty empty -2 -8 0 10 #fcfcfc #000000 #000000 0 1;
 #X floatatom 211 56 5 0 0 0 - - - 0;
-#X msg 301 76 reset;
+#X msg 301 76 scan 0;
 #X obj 146 55 r \$0-rate;
 #X msg 211 76 fusiongain \$1;
 #X obj 267 757 +~;
@@ -1385,7 +1385,7 @@
 #X obj 581 233 vsl 16 136 -1 1 0 0 empty empty empty 0 -9 0 10 #ebf0f7 #000000 #000000 0 1;
 #X obj 611 233 vsl 16 136 -1 1 0 0 empty empty empty 0 -9 0 10 #ebf0f7 #000000 #000000 0 1;
 #X obj 285 522 *~;
-#X msg 331 535 reset;
+#X msg 331 535 scan 0;
 #X obj 285 566 x/cym~;
 #A saved 0.292371 36.0918 24000 2.01186 7.23201;
 #X text 511 228 pi;
@@ -1461,7 +1461,7 @@
 #X obj 426 426 + 0.5;
 #X obj 429 519 * 0.3;
 #X msg 199 126 level;
-#X msg 73 76 reset;
+#X msg 73 76 scan 0;
 #X msg 253 127 zzero;
 #X obj 47 492 x/lp_bw3~ 100;
 #X obj 839 421 show~;
