@@ -24,6 +24,9 @@
 // SimpleBLE includes - use simplecble C API headers directly
 // Note: in newer SimpleBLE, the C API lives in simplecble/simplecble.h
 #include <simplecble/simplecble.h>
+
+#define WITSENSORBLE_LOG(ble, ...) \
+    logpost((ble) && (ble)->pd_obj ? (const void*)(ble)->pd_obj : NULL, 3, __VA_ARGS__)
 #include "m_pd.h"
 // Pd-thread handler to announce scan completion and print cached devices
 extern void witsensor_pd_scan_complete_handler(t_pd *obj, void *data);
@@ -148,7 +151,7 @@ static void simpleble_on_disconnected(simpleble_peripheral_t peripheral, void *u
     witsensor_ble_simpleble_t *ble_data = (witsensor_ble_simpleble_t *)user_data;
     if (!ble_data) return;
     
-    post("WITSensorBLE: Device disconnected unexpectedly");
+    WITSENSORBLE_LOG(ble_data, "WITSensorBLE: Device disconnected unexpectedly");
     ble_data->is_connected = 0;
     
     // Notify Pd layer about disconnection
@@ -165,7 +168,7 @@ static void simpleble_on_disconnected(simpleble_peripheral_t peripheral, void *u
 witsensor_ble_simpleble_t *witsensor_ble_simpleble_create(void) {
     witsensor_ble_simpleble_t *ble_data = (witsensor_ble_simpleble_t *)calloc(1, sizeof(witsensor_ble_simpleble_t));
     if (!ble_data) {
-        post("WITSensorBLE: Failed to allocate memory");
+        logpost(NULL, 3, "WITSensorBLE: Failed to allocate memory");
         return NULL;
     }
     
@@ -216,13 +219,13 @@ void witsensor_ble_simpleble_start_scanning(witsensor_ble_simpleble_t *ble_data)
         return;
     }
     
-    post("WITSensorBLE: Starting BLE scan ...");
+    WITSENSORBLE_LOG(ble_data, "WITSensorBLE: Starting BLE scan ...");
     
     // Authorization already checked on object creation
     
     // Try to initialize BLE now
     if (!ble_data->adapter) {
-        post("WITSensorBLE: Attempting BLE initialization on first scan...");
+        WITSENSORBLE_LOG(ble_data, "WITSensorBLE: Attempting BLE initialization on first scan...");
         
         // Try to get adapter count first
         size_t adapter_count = simpleble_adapter_get_count();
@@ -243,7 +246,7 @@ void witsensor_ble_simpleble_start_scanning(witsensor_ble_simpleble_t *ble_data)
         simpleble_adapter_set_callback_on_scan_stop(ble_data->adapter, simpleble_on_scan_stop, ble_data);
         simpleble_adapter_set_callback_on_scan_found(ble_data->adapter, simpleble_on_scan_found, ble_data);
         
-        post("WITSensorBLE: BLE adapter initialized successfully");
+        WITSENSORBLE_LOG(ble_data, "WITSensorBLE: BLE adapter initialized successfully");
     }
     
     // Check if Bluetooth is enabled before attempting scan
@@ -273,7 +276,7 @@ void witsensor_ble_simpleble_start_scanning(witsensor_ble_simpleble_t *ble_data)
         return;
     }
     // Continuous scanning - scan until manually stopped or connection succeeds
-    post("WITSensorBLE: continuous scanning (no timeout)");
+    WITSENSORBLE_LOG(ble_data, "WITSensorBLE: continuous scanning (no timeout)");
 }
 
 // Stop scanning for devices
@@ -283,18 +286,18 @@ void witsensor_ble_simpleble_stop_scanning(witsensor_ble_simpleble_t *ble_data) 
     s_adapter_scan_active = 0;
     s_scan_owner = NULL;  /* any instance can stop; clear so next scan can start */
     
-    post("WITSensorBLE: Stopping BLE scan...");
+    WITSENSORBLE_LOG(ble_data, "WITSensorBLE: Stopping BLE scan...");
     
     if (!witsensor_ble_simpleble_ensure_initialized(ble_data)) {
-        post("WITSensorBLE: Failed to initialize BLE system");
+        WITSENSORBLE_LOG(ble_data, "WITSensorBLE: Failed to initialize BLE system");
         return;
     }
     // Stop scanning
     simpleble_err_t err = simpleble_adapter_scan_stop(ble_data->adapter);
     if (err != SIMPLEBLE_SUCCESS) {
-        post("WITSensorBLE: Failed to stop scan, error: %d", err);
+        WITSENSORBLE_LOG(ble_data, "WITSensorBLE: Failed to stop scan, error: %d", err);
     } else {
-        post("WITSensorBLE: BLE scan stopped successfully");
+        WITSENSORBLE_LOG(ble_data, "WITSensorBLE: BLE scan stopped successfully");
     }
     
     ble_data->is_scanning = 0;
@@ -305,16 +308,16 @@ void witsensor_ble_simpleble_log_scan_results(witsensor_ble_simpleble_t *ble_dat
     if (!ble_data || !ble_data->adapter) return;
     size_t n = simpleble_adapter_scan_get_results_count(ble_data->adapter);
     if (n == 0) {
-        post("WITSensorBLE: Found 0 devices. Ensure Bluetooth is on and devices are advertising.");
+        WITSENSORBLE_LOG(ble_data, "WITSensorBLE: Found 0 devices. Ensure Bluetooth is on and devices are advertising.");
         return;
     }
-    post("WITSensorBLE: Found %zu devices", n);
+    WITSENSORBLE_LOG(ble_data, "WITSensorBLE: Found %zu devices", n);
     for (size_t i = 0; i < n; i++) {
         simpleble_peripheral_t p = simpleble_adapter_scan_get_results_handle(ble_data->adapter, i);
         if (!p) continue;
         char *id = simpleble_peripheral_identifier(p);
         char *addr = simpleble_peripheral_address(p);
-        if (id && addr) post("WITSensorBLE: Found device: %s [%s]", id, addr);
+        if (id && addr) WITSENSORBLE_LOG(ble_data, "WITSensorBLE: Found device: %s [%s]", id, addr);
         if (id) simpleble_free(id);
         if (addr) simpleble_free(addr);
         simpleble_peripheral_release_handle(p);
@@ -327,7 +330,7 @@ void witsensor_ble_simpleble_get_scan_results(witsensor_ble_simpleble_t *ble_dat
     
     // Ensure BLE is initialized
     if (!witsensor_ble_simpleble_ensure_initialized(ble_data)) {
-        post("WITSensorBLE: Failed to initialize BLE system");
+        WITSENSORBLE_LOG(ble_data, "WITSensorBLE: Failed to initialize BLE system");
         return;
     }
     
@@ -398,7 +401,7 @@ int witsensor_ble_simpleble_connect(witsensor_ble_simpleble_t *ble_data, const c
     if (!ble_data || !target) return 0;
     // Ensure BLE is initialized (gets adapter when NULL)
     if (!witsensor_ble_simpleble_ensure_initialized(ble_data)) {
-        post("WITSensorBLE: Failed to initialize BLE system");
+        WITSENSORBLE_LOG(ble_data, "WITSensorBLE: Failed to initialize BLE system");
         return 0;
     }
 
@@ -464,7 +467,7 @@ int witsensor_ble_simpleble_connect(witsensor_ble_simpleble_t *ble_data, const c
 void witsensor_ble_simpleble_disconnect(witsensor_ble_simpleble_t *ble_data) {
     if (!ble_data) return;
     
-    post("WITSensorBLE: Disconnecting from device...");
+    WITSENSORBLE_LOG(ble_data, "WITSensorBLE: Disconnecting from device...");
     
     if (ble_data->peripheral) {
         simpleble_peripheral_disconnect(ble_data->peripheral);
@@ -473,7 +476,7 @@ void witsensor_ble_simpleble_disconnect(witsensor_ble_simpleble_t *ble_data) {
     }
     
     ble_data->is_connected = 0;
-    post("WITSensorBLE: Disconnected from device");
+    WITSENSORBLE_LOG(ble_data, "WITSensorBLE: Disconnected from device");
 }
 
 // Write data to device - send WIT sensor commands

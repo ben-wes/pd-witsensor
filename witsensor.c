@@ -591,13 +591,13 @@ void witsensor_pd_scan_complete_handler(t_pd *obj, void *data) {
     (void)data;
     t_witsensor *x = (t_witsensor *)obj;
     if (!x || !x->ble_data) return;
-    post("WITSensorBLE: Scan complete.");
+    logpost(x, 3, "WITSensorBLE: Scan complete.");
     // Debug: print adapter info and callback-found count if available
     if (x->ble_data->adapter_id[0] || x->ble_data->adapter_addr[0]) {
-        post("WITSensorBLE: Adapter %s [%s]", x->ble_data->adapter_id, x->ble_data->adapter_addr);
+        logpost(x, 3, "WITSensorBLE: Adapter %s [%s]", x->ble_data->adapter_id, x->ble_data->adapter_addr);
     }
     if (x->ble_data->scan_found_count > 0) {
-        post("WITSensorBLE: Devices seen via callbacks: %d", x->ble_data->scan_found_count);
+        logpost(x, 3, "WITSensorBLE: Devices seen via callbacks: %d", x->ble_data->scan_found_count);
     }
     witsensor_ble_simpleble_log_scan_results(x->ble_data);
 }
@@ -1097,7 +1097,6 @@ static void witsensor_scan_devices(t_witsensor *x, t_symbol *s, int argc, t_atom
             pd_error(x, "witsensor: cannot scan while connected (SimpleBLE clears device list on scan start); disconnect first");
             return;
         }
-        post("witsensor: scanning for BLE devices...");
         if (!x->ble_data) { post("witsensor: BLE not initialized"); return; }
         witsensor_ble_simpleble_start_scanning(x->ble_data);
     } else {
@@ -1166,7 +1165,6 @@ static void witsensor_connect(t_witsensor *x, t_symbol *s, int argc, t_atom *arg
             if (!has_any_pending_target() && witsensor_ble_simpleble_is_any_scanning())
                 witsensor_ble_simpleble_stop_scanning(x->ble_data);
         } else {
-            post("witsensor: starting autoconnect...");
             x->pending_target = gensym(x->device_name[0] ? x->device_name : "*");
             if (!witsensor_ble_simpleble_is_scanning(x->ble_data)) {
                 witsensor_ble_simpleble_start_scanning(x->ble_data);
@@ -1663,14 +1661,14 @@ static void *witsensor_new(t_symbol *s, int argc, t_atom *argv) {
     x->version_buf_flags = 0;
     
     // Initialize BLE data structure (adapter will be created on first scan)
-    post("witsensor: initializing BLE system...");
+    logpost(x, 3, "witsensor: initializing BLE system...");
     x->ble_data = witsensor_ble_simpleble_create();
     if (x->ble_data) {
         // Set up data callback
         x->ble_data->pd_obj = x;
         x->ble_data->data_callback = witsensor_ble_data_callback;
         x->ble_data->pd_instance = x->pd_instance;
-        post("witsensor: BLE data structure ready (adapter will initialize on first scan)");
+        logpost(x, 3, "witsensor: BLE data structure ready (adapter will initialize on first scan)");
     } else {
         pd_error(x, "witsensor: BLE system initialization failed");
     }
