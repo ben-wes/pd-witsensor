@@ -540,5 +540,4 @@ void witmagic_setup(void) {
     class_addmethod(witmagic_class, (t_method)witmagic_zzero, gensym("zzero"), 0);
     class_addmethod(witmagic_class, (t_method)witmagic_magcal, gensym("magcal"), A_DEFFLOAT, 0);
     class_addmethod(witmagic_class, (t_method)witmagic_anything, gensym("anything"), A_GIMME, 0);
-    class_sethelpsymbol(witmagic_class, gensym("witmagic-help"));
 }
