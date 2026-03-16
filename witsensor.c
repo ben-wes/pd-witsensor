@@ -66,7 +66,6 @@ typedef struct _witsensor {
     int is_connected;
     int is_scanning;
     char device_name[64];
-    char device_address[32];
     
     // Data buffers
     unsigned char temp_bytes[PACKET_SIZE];
@@ -639,24 +638,25 @@ void witsensor_pd_device_found_handler(t_pd *obj, void *data) {
         for (t_witsensor *p = s_instances; p; p = p->next_instance) {
             if (!p->pending_target || p->is_connected) continue;
             output_device_to(p, d);
-            if (!connect_target && p->ble_data && d->id) {
+            if (!connect_target && p->ble_data && (d->addr || d->id)) {
                 const char *target = p->pending_target->s_name;
                 int should_connect = 0;
                 if (target && target[0] && strcmp(target, "*") != 0) {
-                    if ((strcmp(d->id, target) == 0) || (d->addr && strcmp(d->addr, target) == 0))
+                    if ((d->id && strcmp(d->id, target) == 0) || (d->addr && strcmp(d->addr, target) == 0))
                         should_connect = 1;
                 } else if (target && strcmp(target, "*") == 0) {
-                    if (d->tag && strcmp(d->tag, "wit") == 0
-                        && !witsensor_ble_simpleble_is_device_connected(p->ble_data, d->id))
+                    /* Use address (UUID) for uniqueness - identifier (name) is shared by same-model devices on macOS */
+                    const char *match_id = d->addr ? d->addr : d->id;
+                    if (d->tag && strcmp(d->tag, "wit") == 0 && match_id
+                        && !witsensor_ble_simpleble_is_device_connected(p->ble_data, match_id))
                         should_connect = 1;
                 }
                 if (should_connect) connect_target = p;
             }
         }
-        if (connect_target && d->id) {
-            t_atom ac[1]; SETSYMBOL(&ac[0], gensym(d->id));
-            outlet_anything(connect_target->status_out, gensym("autoconnecting"), 1, ac);
-            t_atom a[1]; SETSYMBOL(&a[0], gensym(d->id));
+        if (connect_target && (d->addr || d->id)) {
+            const char *connect_target_str = d->addr ? d->addr : d->id;
+            t_atom a[1]; SETSYMBOL(&a[0], gensym(connect_target_str));
             witsensor_connect(connect_target, &s_, 1, a);
             connect_target->pending_target = NULL;
         } else if (!has_any_pending_target() && x && !x->is_connected) {
@@ -1058,6 +1058,17 @@ void witsensor_pd_connected_handler(t_pd *obj, void *data) {
     t_atom a;
     SETFLOAT(&a, flag->value);
     outlet_anything(x->status_out, gensym("connected"), 1, &a);
+    if (flag->value && x->ble_data) {
+        char addr_buf[64] = "", id_buf[64] = "";
+        if (witsensor_ble_simpleble_get_connected_address(x->ble_data, addr_buf, sizeof(addr_buf))) {
+            t_atom aa; SETSYMBOL(&aa, gensym(addr_buf));
+            outlet_anything(x->status_out, gensym("address"), 1, &aa);
+        }
+        if (witsensor_ble_simpleble_get_connected_identifier(x->ble_data, id_buf, sizeof(id_buf))) {
+            t_atom an; SETSYMBOL(&an, gensym(id_buf));
+            outlet_anything(x->status_out, gensym("name"), 1, &an);
+        }
+    }
     
     if (flag->value) {
         witsensor_query_config(x);
@@ -1139,8 +1150,19 @@ static void witsensor_connect(t_witsensor *x, t_symbol *s, int argc, t_atom *arg
             clock_unset(x->poll_clock);
             witsensor_poll_dejitter_clear(x);
             witsensor_query_config(x);
+            char addr_buf[64] = "", id_buf[64] = "";
+            witsensor_ble_simpleble_get_connected_address(x->ble_data, addr_buf, sizeof(addr_buf));
+            witsensor_ble_simpleble_get_connected_identifier(x->ble_data, id_buf, sizeof(id_buf));
             t_atom a; SETFLOAT(&a, 1);
             outlet_anything(x->status_out, gensym("connected"), 1, &a);
+            if (addr_buf[0]) {
+                t_atom aa; SETSYMBOL(&aa, gensym(addr_buf));
+                outlet_anything(x->status_out, gensym("address"), 1, &aa);
+            }
+            if (id_buf[0]) {
+                t_atom an; SETSYMBOL(&an, gensym(id_buf));
+                outlet_anything(x->status_out, gensym("name"), 1, &an);
+            }
             if (!has_any_pending_target() && witsensor_ble_simpleble_is_any_scanning())
                 witsensor_ble_simpleble_stop_scanning(x->ble_data);
         } else {
@@ -1784,7 +1806,12 @@ static void witsensor_get_cmd(t_witsensor *x, t_symbol *s, int argc, t_atom *arg
     t_symbol *type = atom_getsymbol(argv + 0);
     if (type == gensym("name")) {
         t_atom a;
-        SETSYMBOL(&a, gensym(x->device_name[0] ? x->device_name : ""));
+        char id_buf[64] = "";
+        if (x->ble_data && witsensor_ble_simpleble_get_connected_identifier(x->ble_data, id_buf, sizeof(id_buf))) {
+            SETSYMBOL(&a, gensym(id_buf));
+        } else {
+            SETSYMBOL(&a, gensym(""));
+        }
         outlet_anything(x->status_out, gensym("name"), 1, &a);
         return;
     }

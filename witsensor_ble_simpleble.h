@@ -67,8 +67,10 @@ int witsensor_ble_simpleble_is_connected(witsensor_ble_simpleble_t *ble_data);
 int witsensor_ble_simpleble_is_scanning(witsensor_ble_simpleble_t *ble_data);
 // Returns 1 if any instance is currently scanning (for device_found suppress check)
 int witsensor_ble_simpleble_is_any_scanning(void);
-// Get connected device's BLE address (e.g. "AA:BB:CC:DD:EE:FF"). Returns 1 on success, 0 if not connected.
+// Get connected device's BLE address (e.g. UUID on macOS). Returns 1 on success, 0 if no peripheral.
 int witsensor_ble_simpleble_get_connected_address(witsensor_ble_simpleble_t *ble_data, char *buf, size_t bufsize);
+// Get connected device's identifier (e.g. name like "WT901BLE67"). Returns 1 on success, 0 if no peripheral.
+int witsensor_ble_simpleble_get_connected_identifier(witsensor_ble_simpleble_t *ble_data, char *buf, size_t bufsize);
 // Permission probe: returns number of devices found after a short bounded scan,
 // or -1 on initialization failure
 int witsensor_ble_simpleble_ensure_initialized(witsensor_ble_simpleble_t *ble_data);

@@ -109,7 +109,8 @@ static void simpleble_on_scan_found(simpleble_adapter_t adapter, simpleble_perip
     (void)adapter;
     witsensor_ble_simpleble_t *ble_data = (witsensor_ble_simpleble_t *)user_data;
     if (!ble_data || !peripheral) return;
-    if (ble_data->is_connected) return;
+    /* Do NOT return when scan owner is connected: other instances may still need device_found
+     * for autoconnect. The Pd handler filters by pending_target and is_device_connected. */
     char *addr = simpleble_peripheral_address(peripheral);
     char *id = simpleble_peripheral_identifier(peripheral);
     if (id && ble_data->pd_instance && ble_data->pd_obj) {
@@ -282,7 +283,7 @@ void witsensor_ble_simpleble_stop_scanning(witsensor_ble_simpleble_t *ble_data) 
     s_adapter_scan_active = 0;
     s_scan_owner = NULL;  /* any instance can stop; clear so next scan can start */
     
-    post("WITSensorBLE: Stopping cross-platform scan...");
+    post("WITSensorBLE: Stopping BLE scan...");
     
     if (!witsensor_ble_simpleble_ensure_initialized(ble_data)) {
         post("WITSensorBLE: Failed to initialize BLE system");
@@ -368,15 +369,18 @@ int witsensor_ble_simpleble_get_first_wit_id(witsensor_ble_simpleble_t *ble_data
     return 0;
 }
 
-// Returns 1 if device with given id is already connected (to any instance)
-int witsensor_ble_simpleble_is_device_connected(witsensor_ble_simpleble_t *ble_data, const char *id) {
-    if (!ble_data || !id || !ble_data->adapter) return 0;
+// Returns 1 if device with given id or address is already connected (to any instance)
+// Prefer address (UUID) for matching - identifier (name) can be shared by multiple devices on macOS
+int witsensor_ble_simpleble_is_device_connected(witsensor_ble_simpleble_t *ble_data, const char *id_or_addr) {
+    if (!ble_data || !id_or_addr || !ble_data->adapter) return 0;
     size_t n = simpleble_adapter_scan_get_results_count(ble_data->adapter);
     for (size_t i = 0; i < n; i++) {
         simpleble_peripheral_t p = simpleble_adapter_scan_get_results_handle(ble_data->adapter, i);
         if (!p) continue;
+        char *addr = simpleble_peripheral_address(p);
         char *pid = simpleble_peripheral_identifier(p);
-        int match = (pid && strcmp(pid, id) == 0);
+        int match = (addr && strcmp(addr, id_or_addr) == 0) || (pid && strcmp(pid, id_or_addr) == 0);
+        if (addr) simpleble_free(addr);
         if (pid) simpleble_free(pid);
         if (match) {
             bool connected = false;
@@ -540,11 +544,22 @@ int witsensor_ble_simpleble_is_any_scanning(void) {
 // Get connected device's BLE address
 int witsensor_ble_simpleble_get_connected_address(witsensor_ble_simpleble_t *ble_data, char *buf, size_t bufsize) {
     if (!ble_data || !buf || bufsize < 2) return 0;
-    if (!ble_data->is_connected || !ble_data->peripheral) return 0;
+    if (!ble_data->peripheral) return 0;
     char *addr = simpleble_peripheral_address(ble_data->peripheral);
     if (!addr) return 0;
     snprintf(buf, bufsize, "%s", addr);
     simpleble_free(addr);
+    return 1;
+}
+
+// Get connected device's identifier (name)
+int witsensor_ble_simpleble_get_connected_identifier(witsensor_ble_simpleble_t *ble_data, char *buf, size_t bufsize) {
+    if (!ble_data || !buf || bufsize < 2) return 0;
+    if (!ble_data->peripheral) return 0;
+    char *id = simpleble_peripheral_identifier(ble_data->peripheral);
+    if (!id) return 0;
+    snprintf(buf, bufsize, "%s", id);
+    simpleble_free(id);
     return 1;
 }
 
