@@ -203,10 +203,15 @@ int witsensor_ble_simpleble_ensure_initialized(witsensor_ble_simpleble_t *ble_da
 void witsensor_ble_simpleble_start_scanning(witsensor_ble_simpleble_t *ble_data) {
     if (!ble_data) return;
 
-    /* Serial scan: only one instance can own the scan (SimpleBLE has one callback slot).
-     * Warn and return if another instance is already scanning. */
+    /* If already scanning, just switch callback to this instance (no scan 0 needed) */
     if (s_scan_owner != NULL && s_scan_owner != ble_data) {
-        post("witsensor: another instance is already scanning - stop it first, or use 'connect <device_id>' with a known ID");
+        if (!witsensor_ble_simpleble_ensure_initialized(ble_data)) return;
+        simpleble_adapter_set_callback_on_scan_found(ble_data->adapter, simpleble_on_scan_found, ble_data);
+        ble_data->is_scanning = 1;
+        if (ble_data->pd_instance && ble_data->pd_obj) {
+            t_queued_flag *q = (t_queued_flag *)malloc(sizeof(t_queued_flag));
+            if (q) { q->value = 1; pd_queue_mess((t_pdinstance*)ble_data->pd_instance, (t_pd*)ble_data->pd_obj, q, witsensor_pd_scanning_handler); }
+        }
         return;
     }
     
