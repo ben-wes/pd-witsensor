@@ -65,6 +65,8 @@ int witsensor_ble_simpleble_write_request_raw(witsensor_ble_simpleble_t *ble_dat
 int witsensor_ble_simpleble_set_notifications_enabled(witsensor_ble_simpleble_t *ble_data, int enabled);
 int witsensor_ble_simpleble_is_connected(witsensor_ble_simpleble_t *ble_data);
 int witsensor_ble_simpleble_is_scanning(witsensor_ble_simpleble_t *ble_data);
+// Returns 1 if any instance is currently scanning (for device_found suppress check)
+int witsensor_ble_simpleble_is_any_scanning(void);
 // Get connected device's BLE address (e.g. "AA:BB:CC:DD:EE:FF"). Returns 1 on success, 0 if not connected.
 int witsensor_ble_simpleble_get_connected_address(witsensor_ble_simpleble_t *ble_data, char *buf, size_t bufsize);
 // Permission probe: returns number of devices found after a short bounded scan,

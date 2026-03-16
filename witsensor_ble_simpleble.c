@@ -50,6 +50,7 @@ static simpleble_uuid_t WIT_READ_CHARACTERISTIC_UUID = {.value = WIT_READ_CHARAC
 
 /* Serial scan: only one instance can own the scan at a time (SimpleBLE has one callback slot). */
 static witsensor_ble_simpleble_t *s_scan_owner = NULL;
+static int s_adapter_scan_active = 0;  /* 1 while adapter is scanning (stays true when owner connects) */
 
 // Output devices from adapter (single source of truth - no per-instance cache)
 static void _output_scan_results(witsensor_ble_simpleble_t *ble_data) {
@@ -95,6 +96,7 @@ static void simpleble_on_scan_stop(simpleble_adapter_t adapter, void *user_data)
     witsensor_ble_simpleble_t *ble_data = (witsensor_ble_simpleble_t *)user_data;
     if (!ble_data) return;
     if (s_scan_owner == ble_data) s_scan_owner = NULL;
+    s_adapter_scan_active = 0;
     ble_data->is_scanning = 0;
     // Emit scanning 0 via Pd thread
     if (ble_data->pd_instance && ble_data->pd_obj) {
@@ -244,7 +246,11 @@ void witsensor_ble_simpleble_start_scanning(witsensor_ble_simpleble_t *ble_data)
         return;
     }
     
+    /* Ensure scan_found callback points to this instance (SimpleBLE has one callback slot) */
+    simpleble_adapter_set_callback_on_scan_found(ble_data->adapter, simpleble_on_scan_found, ble_data);
+    
     s_scan_owner = ble_data;
+    s_adapter_scan_active = 1;
     ble_data->is_scanning = 1;
     // Emit scanning 1 via Pd thread
     if (ble_data->pd_instance && ble_data->pd_obj) {
@@ -255,6 +261,7 @@ void witsensor_ble_simpleble_start_scanning(witsensor_ble_simpleble_t *ble_data)
     simpleble_err_t err = simpleble_adapter_scan_start(ble_data->adapter);
     if (err != SIMPLEBLE_SUCCESS) {
         s_scan_owner = NULL;
+        s_adapter_scan_active = 0;
         ble_data->is_scanning = 0;
         pd_error(ble_data->pd_obj, "WITSensorBLE: scan_start failed: %d", err);
         return;
@@ -266,16 +273,16 @@ void witsensor_ble_simpleble_start_scanning(witsensor_ble_simpleble_t *ble_data)
 // Stop scanning for devices
 void witsensor_ble_simpleble_stop_scanning(witsensor_ble_simpleble_t *ble_data) {
     if (!ble_data) return;
+    /* Suppress device_found immediately; set before any async work */
+    s_adapter_scan_active = 0;
+    s_scan_owner = NULL;  /* any instance can stop; clear so next scan can start */
     
     post("WITSensorBLE: Stopping cross-platform scan...");
     
-    // Ensure BLE is initialized
     if (!witsensor_ble_simpleble_ensure_initialized(ble_data)) {
         post("WITSensorBLE: Failed to initialize BLE system");
         return;
     }
-    
-    if (s_scan_owner == ble_data) s_scan_owner = NULL;
     // Stop scanning
     simpleble_err_t err = simpleble_adapter_scan_stop(ble_data->adapter);
     if (err != SIMPLEBLE_SUCCESS) {
@@ -418,12 +425,8 @@ int witsensor_ble_simpleble_connect(witsensor_ble_simpleble_t *ble_data, const c
             if (simpleble_peripheral_connect(p) == SIMPLEBLE_SUCCESS) {
                 ble_data->peripheral = p;
                 ble_data->is_connected = 1;
-                if (s_scan_owner == ble_data) s_scan_owner = NULL;
-
-                if (ble_data->is_scanning) {
-                    simpleble_adapter_scan_stop(ble_data->adapter);
-                    ble_data->is_scanning = 0;
-                }
+                /* Keep adapter scan running so other instances with pending_target can connect */
+                if (ble_data->is_scanning) ble_data->is_scanning = 0;
 
                 simpleble_uuid_t service_uuid = {.value = WIT_SERVICE_UUID_STR};
                 simpleble_uuid_t read_characteristic_uuid = {.value = WIT_READ_CHARACTERISTIC_UUID_STR};
@@ -522,6 +525,11 @@ int witsensor_ble_simpleble_is_connected(witsensor_ble_simpleble_t *ble_data) {
 int witsensor_ble_simpleble_is_scanning(witsensor_ble_simpleble_t *ble_data) {
     if (!ble_data) return 0;
     return ble_data->is_scanning;
+}
+
+// Returns 1 if adapter scan is active (stays true when owner connects so others can autoconnect)
+int witsensor_ble_simpleble_is_any_scanning(void) {
+    return s_adapter_scan_active;
 }
 
 // Get connected device's BLE address
