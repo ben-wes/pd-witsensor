@@ -1,11 +1,16 @@
 /* witmagic.c
  * Pure Data external: IMU motion processor (accel + gyro [+ mag] -> cleaned movement/orientation)
  * Uses Madgwick filter (IMU or AHRS with magnetometer), gravity subtraction, velocity integration.
- * 
+ *
  * Inlet: list [ax ay az gx gy gz], or accel/gyro (3 floats each). Mag via "mag" message.
- * Units: accel in g (1g = gravity), gyro in °/s, mag any (normalized internally). Frame: x right, y front, z up.
+ * Units: accel in g (1g = gravity), gyro in °/s, mag in µT (normalized internally). Frame: x right, y front, z up.
  * Mag at lower rate OK: last mag used until new one arrives. Messages: rate, level, magcal, reset, zzero, fusiongain, veldecay.
- * 
+ *
+ * Expected ranges (witsensor): accel ±16g (rest ~±1g), gyro ±2000°/s, mag ~25–65 µT (Earth field).
+ * acclin (linear accel) = rotated accel − gravity; ~0 when still, ±1 at 1g linear. Depends on orientation;
+ * higher fusiongain → faster orientation tracking → acclin adapts faster to motion. veldecay controls
+ * speed (integrated acclin) decay; lower = faster return to zero when motion stops.
+ *
  * This is free and unencumbered software released into the public domain.
  */
 
@@ -307,7 +312,8 @@ static void witmagic_process(t_witmagic *x, float ax, float ay, float az,
     float aw_x, aw_y, aw_z;
     quat_rotate_vector(x->qw, x->qx, x->qy, x->qz, ax, ay, az, &aw_x, &aw_y, &aw_z);
 
-    /* 3. Subtract gravity (accel in g, so gravity = [0,0,1]) */
+    /* 3. Subtract gravity (accel in g, so gravity = [0,0,1]). acclin adapts with orientation;
+     * higher fusiongain → faster quaternion → acclin responds faster to motion. */
     float ad_x = aw_x;
     float ad_y = aw_y;
     float ad_z = aw_z - 1.f;
