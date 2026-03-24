@@ -30,46 +30,48 @@ static t_class *butter3_tilde_class;
 
 /* Per-channel filter state and coefficients */
 typedef struct {
-    float y1, x1, s1, s2;
-    float b0_1, a1_1;
-    float b0_2, b1_2, b2_2, a1_2, a2_2;
-    float fc_prev;
+    t_float y1, x1, s1, s2;
+    t_float b0_1, a1_1;
+    t_float b0_2, b1_2, b2_2, a1_2, a2_2;
+    t_float fc_prev;
 } Butter3Chan;
 
 typedef struct _butter3_tilde {
     t_object      x_obj;
     int           x_n;
     Butter3Chan  *x_chan;
-    float         x_sr;
-    float         x_fc;        /* dummy for CLASS_MAINSIGNALIN */
-    float        *x_in;
-    float        *x_in_freq;
-    float        *x_out;
+    t_float       x_sr;
+    t_float       x_fc;        /* must be t_float for CLASS_MAINSIGNALIN */
+    t_sample     *x_in;
+    t_sample     *x_in_freq;
+    t_sample     *x_out;
     int           x_bs;
     int           x_nc_a;
     int           x_nc_f;
 } t_butter3_tilde;
 
-static void butter3_coeffs(Butter3Chan *c, float fc, float sr)
+static void butter3_coeffs(Butter3Chan *c, t_float fc, t_float sr)
 {
-    if (fc < 0.1) fc = 0.1;
-    if (fc > sr * 0.49) fc = sr * 0.49;
+    t_float f = fc;
+    t_float s = sr;
+    if (f < 0.1) f = 0.1;
+    if (f > s * 0.49) f = s * 0.49;
 
-    float K1 = tanf((float)M_PI * fc / sr);
+    t_float K1 = tan(M_PI * f / s);
     c->b0_1 = K1 / (1 + K1);
     c->a1_1 = (K1 - 1) / (1 + K1);
 
-    float w0 = (float)(2.0 * M_PI) * fc / sr;
-    float cosw = cosf(w0);
-    float sinw = sinf(w0);
-    float alpha = sinw * 0.5;
-    float norm = 1 / (1 + alpha);
+    t_float w0 = 2.0 * M_PI * f / s;
+    t_float cosw = cos(w0);
+    t_float sinw = sin(w0);
+    t_float alpha = sinw * 0.5;
+    t_float norm = 1.0 / (1.0 + alpha);
     c->b0_2 = (1 - cosw) * 0.5 * norm;
     c->b1_2 = (1 - cosw) * norm;
     c->b2_2 = c->b0_2;
-    c->a1_2 = -2 * cosw * norm;
+    c->a1_2 = -2.0 * cosw * norm;
     c->a2_2 = (1 - alpha) * norm;
-    c->fc_prev = fc;
+    c->fc_prev = f;
 }
 
 static t_int *butter3_tilde_perform(t_int *w)
@@ -79,28 +81,28 @@ static t_int *butter3_tilde_perform(t_int *w)
 
     int n = x->x_n;
     int bs = x->x_bs;
-    float sr = x->x_sr;
+    t_float sr = x->x_sr;
     int nc_a = x->x_nc_a;
     int nc_f = x->x_nc_f;
 
-    float *in = x->x_in;
-    float *in_freq = x->x_in_freq;
-    float *out = x->x_out;
+    t_sample *in = x->x_in;
+    t_sample *in_freq = x->x_in_freq;
+    t_sample *out = x->x_out;
 
     for (int ch = 0; ch < n; ch++) {
         Butter3Chan *c = &x->x_chan[ch];
-        float *a = in + INLET_CH(ch, nc_a) * bs;
-        float *frq = in_freq + INLET_CH(ch, nc_f) * bs;
-        float *o = out + ch * bs;
+        t_sample *a = in + INLET_CH(ch, nc_a) * bs;
+        t_sample *frq = in_freq + INLET_CH(ch, nc_f) * bs;
+        t_sample *o = out + ch * bs;
 
-        float y1 = c->y1, x1 = c->x1, s1 = c->s1, s2 = c->s2;
-        float b0_1 = c->b0_1, a1_1 = c->a1_1;
-        float b0_2 = c->b0_2, b1_2 = c->b1_2, b2_2 = c->b2_2;
-        float a1_2 = c->a1_2, a2_2 = c->a2_2;
-        float fc_prev = c->fc_prev;
+        t_float y1 = c->y1, x1 = c->x1, s1 = c->s1, s2 = c->s2;
+        t_float b0_1 = c->b0_1, a1_1 = c->a1_1;
+        t_float b0_2 = c->b0_2, b1_2 = c->b1_2, b2_2 = c->b2_2;
+        t_float a1_2 = c->a1_2, a2_2 = c->a2_2;
+        t_float fc_prev = c->fc_prev;
 
         for (int i = 0; i < bs; i++) {
-            float fc = frq[i];
+            t_float fc = frq[i];
             if (fc != fc_prev && fc == fc) {
                 butter3_coeffs(c, fc, sr);
                 b0_1 = c->b0_1; a1_1 = c->a1_1;
@@ -109,13 +111,13 @@ static t_int *butter3_tilde_perform(t_int *w)
                 fc_prev = fc;
             }
 
-            float x0 = a[i];
-            float v1 = b0_1 * (x0 + x1) - a1_1 * y1;
+            t_float x0 = a[i];
+            t_float v1 = b0_1 * (x0 + x1) - a1_1 * y1;
             x1 = x0;
             y1 = v1;
 
-            float s0 = v1 - a1_2 * s1 - a2_2 * s2;
-            float v2 = b0_2 * s0 + b1_2 * s1 + b2_2 * s2;
+            t_float s0 = v1 - a1_2 * s1 - a2_2 * s2;
+            t_float v2 = b0_2 * s0 + b1_2 * s1 + b2_2 * s2;
             s2 = s1;
             s1 = s0;
 

@@ -1,6 +1,13 @@
 # library name
 lib.name = witsensor
 
+# Default macOS minimum versions for local builds (use these names — not MACOSX_DEPLOYMENT_*,
+# which Xcode often exports empty and would break ?= defaults).
+# Override: MACOSX_DEPLOYMENT_TARGET, or WITSENSOR_MACOSX_INTEL_MIN / WITSENSOR_MACOSX_ARM64_MIN.
+# Apple Silicon binaries cannot target macOS 10.x; Intel can (e.g. 10.14 Mojave).
+WITSENSOR_MACOSX_INTEL_MIN := 10.14
+WITSENSOR_MACOSX_ARM64_MIN := 11.0
+
 # Helper variables for Makefile string manipulation
 space := $(subst ,, )
 
@@ -19,12 +26,7 @@ ldlibs = -lpthread -lm
 
 # platform-specific settings - SimpleBLE for all platforms
 # pd-lib-builder: any -mmacosx-version-min= in cflags becomes version.flag (link + compile).
-# Override default: env or make MACOSX_DEPLOYMENT_TARGET=10.13 (Intel); arm64 needs 11.0+.
 define forDarwin
-ifndef MACOSX_DEPLOYMENT_TARGET
-MACOSX_DEPLOYMENT_TARGET := $(if $(filter arm64,$(arch)),11.0,$(if $(filter x86_64,$(arch)),10.14,$(if $(filter arm64,$(shell uname -m)),11.0,10.14)))
-endif
-export MACOSX_DEPLOYMENT_TARGET
 cflags += -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET)
 ldlibs += -L./SimpleBLE/simplecble/build-static/lib -Wl,-force_load,./SimpleBLE/simplecble/build-static/lib/libsimplecble.a -Wl,-force_load,./SimpleBLE/simplecble/build-static/lib/libsimpleble.a -framework CoreBluetooth -framework Foundation
 witsensor.class.sources += macos_bt_auth.m
@@ -49,6 +51,14 @@ datafiles = \
 	witmagic-help.pd \
 	butter3~-help.pd \
 	${empty}
+
+# Set before pd-lib-builder reads cflags; ifeq inside $(eval forDarwin) is unreliable here.
+ifeq ($(shell uname -s),Darwin)
+ifeq ($(strip $(MACOSX_DEPLOYMENT_TARGET)),)
+MACOSX_DEPLOYMENT_TARGET := $(if $(filter arm64,$(arch)),$(WITSENSOR_MACOSX_ARM64_MIN),$(if $(filter x86_64,$(arch)),$(WITSENSOR_MACOSX_INTEL_MIN),$(if $(filter arm64,$(shell uname -m)),$(WITSENSOR_MACOSX_ARM64_MIN),$(WITSENSOR_MACOSX_INTEL_MIN))))
+endif
+export MACOSX_DEPLOYMENT_TARGET
+endif
 
 # include pd-lib-builder
 PDLIBBUILDER_DIR=./pd-lib-builder
