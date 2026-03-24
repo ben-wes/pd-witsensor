@@ -1,15 +1,15 @@
 /* witmagic.c
  * Pure Data external: IMU motion processor (accel + gyro [+ mag] -> cleaned movement/orientation)
- * Uses EKF AHRS (quaternion + gyro bias), gravity subtraction, velocity integration.
+ * Uses Madgwick filter (IMU or AHRS with magnetometer), gravity subtraction, velocity integration.
  *
  * Inlet: list [ax ay az gx gy gz], or accel/gyro (3 floats each). Mag via "mag" message.
  * Units: accel in g (1g = gravity), gyro in °/s, mag in µT (normalized internally). Frame: x right, y front, z up.
- * Mag at lower rate OK: last mag used until new one arrives. Use sensor-calibrated mag (no witmagic cal).
- * Messages: rate, xyzero, reset, zzero, ekf_gain, ekf_q, veldecay.
+ * Mag at lower rate OK: last mag used until new one arrives.
+ * Messages: rate, xyzero, magcal, reset, zzero, fusiongain, veldecay.
  *
- * ekf_gain (0.01–10) scales measurement trust; higher = trust accel/mag more.
- * ekf_q = process noise (gyro/bias uncertainty). Same acclin/speed pipeline as before.
- * rate 0 (default) = use wall-clock dt for gyro integration (recommended for BLE burst).
+ * Prefer raw witsensor mag + witmagic magcal; skip sensor-side magcal if firmware lags.
+ * fusiongain 0.001–1 (default 0.3): Madgwick correction strength. rate 0 = wall-clock dt (good for BLE bursts).
+ * acclin = rotated accel − gravity; higher fusiongain → faster tracking. veldecay: speed leak per sample.
  *
  * This is free and unencumbered software released into the public domain.
  */
@@ -27,267 +27,203 @@
 #define DEG2RAD (3.14159265358979323846f / 180.0f)
 #define RAD2DEG (180.0f / 3.14159265358979323846f)
 #define G_TO_MM_S2  9806.65f         /* 1g = 9.80665 m/s² = 9806.65 mm/s² */
-#define WITMAGIC_EKF_GAIN_DEF  2.0f  /* EKF measurement trust (higher = trust accel/mag more) */
-#define WITMAGIC_EKF_GAIN_MIN  0.01f
-#define WITMAGIC_EKF_GAIN_MAX  10.f
-#define WITMAGIC_EKF_Q_DEF     0.01f /* process noise; higher = more correction from accel/mag */
-#define WITMAGIC_VELDECAY_DEF  0.995f
+#define WITMAGIC_FUSIONGAIN_DEF  0.3f    /* sensor fusion gain (accel+mag correction) */
+#define WITMAGIC_FUSIONGAIN_MIN  0.001f
+#define WITMAGIC_FUSIONGAIN_MAX  1.0f
+#define WITMAGIC_VELDECAY_DEF  0.99f    /* velocity decay per sample (0.5–0.9999) */
 static t_class *witmagic_class;
-
-#define EKF_N 7   /* state: q0,q1,q2,q3, bx,by,bz */
 
 typedef struct _witmagic {
     t_object x_obj;
-
-    /* EKF state: quaternion q (sensor to world), gyro bias in rad/s */
+    
+    /* Madgwick state: quaternion q = w + x*i + y*j + z*k (sensor to world) */
     float qw, qx, qy, qz;
-    float bias_gx, bias_gy, bias_gz;
-    float P[EKF_N * EKF_N];   /* covariance 7x7 */
-    float ekf_gain;
-    float ekf_q;
-    float veldecay;
-    int ekf_initialized;       /* 0 until first accel init */
-
+    float fusiongain;        /* sensor fusion gain (0.001–1 typical) */
+    float veldecay;          /* velocity decay per sample (0.9–0.999 typical) */
+    
     /* Calibration: accel bias subtracted before processing */
     float bias_ax, bias_ay, bias_az;
     int bias_valid;
-
+    
     /* Integration state */
-    float vx, vy, vz;
-
+    float vx, vy, vz;        /* velocity in world frame (mm/s) */
+    
     /* Timing */
     double last_time;
     int first_sample;
-    int do_calibrate_next;
-    float rate_hz;
-    float last_ax, last_ay, last_az;
-    float mag_x, mag_y, mag_z;
+    int do_calibrate_next;    /* next list stores accel as bias */
+    float rate_hz;            /* sample rate; 0 = use wall-clock dt */
+    float last_ax, last_ay, last_az;  /* buffered for accel/gyro split input */
+    float mag_x, mag_y, mag_z;        /* last magnetometer (normalized); used when mag_valid */
     int mag_valid;
-    float yaw_offset;
-
+    float mag_offset_x, mag_offset_y, mag_offset_z;   /* min-max center */
+    float mag_scale_x, mag_scale_y, mag_scale_z;     /* min-max half-range */
+    int mag_cal_valid;
+    float mag_cal_min_x, mag_cal_min_y, mag_cal_min_z;
+    float mag_cal_max_x, mag_cal_max_y, mag_cal_max_z;
+    int mag_cal_count;
+    int mag_cal_collecting;
+    float yaw_offset;        /* subtract from yaw so current heading = 0 */
+    
+    /* Outlet: single outlet, named selectors (quat, acclin, speed) */
     t_outlet *o_out;
 } t_witmagic;
 
+/* Fast inverse sqrt - portable (no strict-aliasing) */
 static inline float inv_sqrt(float x) {
     if (x <= 0.f) return 1.f;
     return 1.f / (float)sqrt((double)x);
 }
 
-/* Rotate vector v by quaternion q: v' = q * v * q^-1 (body to world) */
-static void quat_rotate_vector(float qw, float qx, float qy, float qz,
-                               float vx, float vy, float vz,
-                               float *out_x, float *out_y, float *out_z) {
-    float tx = 2.f * (qy * vz - qz * vy);
-    float ty = 2.f * (qz * vx - qx * vz);
-    float tz = 2.f * (qx * vy - qy * vx);
-    *out_x = vx + qw * tx + (qy * tz - qz * ty);
-    *out_y = vy + qw * ty + (qz * tx - qx * tz);
-    *out_z = vz + qw * tz + (qx * ty - qy * tx);
-}
-
-/* Rotate vector v from world to body: v_body = q* ⊗ v_world ⊗ q */
-static void quat_rotate_inv(float qw, float qx, float qy, float qz,
-                            float vx, float vy, float vz,
-                            float *out_x, float *out_y, float *out_z) {
-    quat_rotate_vector(qw, -qx, -qy, -qz, vx, vy, vz, out_x, out_y, out_z);
-}
-
-/* Invert 3x3 matrix M, result in Mi. Returns 0 on success. */
-static int inv3x3(const float *M, float *Mi) {
-    float det = M[0]*(M[4]*M[8]-M[5]*M[7]) - M[1]*(M[3]*M[8]-M[5]*M[6]) + M[2]*(M[3]*M[7]-M[4]*M[6]);
-    if (fabs((double)det) < 1e-12) return -1;
-    float idet = 1.f / det;
-    Mi[0] = (M[4]*M[8]-M[5]*M[7]) * idet;
-    Mi[1] = (M[2]*M[7]-M[1]*M[8]) * idet;
-    Mi[2] = (M[1]*M[5]-M[2]*M[4]) * idet;
-    Mi[3] = (M[5]*M[6]-M[3]*M[8]) * idet;
-    Mi[4] = (M[0]*M[8]-M[2]*M[6]) * idet;
-    Mi[5] = (M[2]*M[3]-M[0]*M[5]) * idet;
-    Mi[6] = (M[3]*M[7]-M[4]*M[6]) * idet;
-    Mi[7] = (M[1]*M[6]-M[0]*M[7]) * idet;
-    Mi[8] = (M[0]*M[4]-M[1]*M[3]) * idet;
-    return 0;
-}
-
-/* EKF prediction: integrate quaternion with corrected gyro, bias constant */
-static void ekf_predict(t_witmagic *x, float gx, float gy, float gz, float dt) {
+/* Madgwick IMU update (no magnetometer). gyro in rad/s, accel as 3-vector (will be normalized). */
+static void madgwick_imu_update(t_witmagic *x, float gx, float gy, float gz,
+                                float ax, float ay, float az, float dt) {
     float q0 = x->qw, q1 = x->qx, q2 = x->qy, q3 = x->qz;
-    float wx = gx - x->bias_gx, wy = gy - x->bias_gy, wz = gz - x->bias_gz;
+    float recip_norm;
+    float s0, s1, s2, s3;
+    float q_dot1, q_dot2, q_dot3, q_dot4;
+    float _2q0, _2q1, _2q2, _2q3, _4q0, _4q1, _4q2, _8q1, _8q2;
+    float q0q0, q1q1, q2q2, q3q3;
 
-    /* Quaternion integration: q_dot = 0.5 * omega * q */
-    float qd0 = 0.5f * (-q1*wx - q2*wy - q3*wz);
-    float qd1 = 0.5f * ( q0*wx + q2*wz - q3*wy);
-    float qd2 = 0.5f * ( q0*wy - q1*wz + q3*wx);
-    float qd3 = 0.5f * ( q0*wz + q1*wy - q2*wx);
+    /* Rate of change of quaternion from gyroscope */
+    q_dot1 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz);
+    q_dot2 = 0.5f * (q0 * gx + q2 * gz - q3 * gy);
+    q_dot3 = 0.5f * (q0 * gy - q1 * gz + q3 * gx);
+    q_dot4 = 0.5f * (q0 * gz + q1 * gy - q2 * gx);
 
-    q0 += qd0 * dt; q1 += qd1 * dt; q2 += qd2 * dt; q3 += qd3 * dt;
-    float n = inv_sqrt(q0*q0 + q1*q1 + q2*q2 + q3*q3);
-    q0 *= n; q1 *= n; q2 *= n; q3 *= n;
+    if (dt <= 0.f) dt = 0.001f;
+
+    /* Accelerometer feedback only if valid (non-zero) */
+    if (ax != 0.f || ay != 0.f || az != 0.f) {
+        recip_norm = inv_sqrt(ax * ax + ay * ay + az * az);
+        ax *= recip_norm;
+        ay *= recip_norm;
+        az *= recip_norm;
+
+        _2q0 = 2.f * q0; _2q1 = 2.f * q1; _2q2 = 2.f * q2; _2q3 = 2.f * q3;
+        _4q0 = 4.f * q0; _4q1 = 4.f * q1; _4q2 = 4.f * q2;
+        _8q1 = 8.f * q1; _8q2 = 8.f * q2;
+        q0q0 = q0 * q0; q1q1 = q1 * q1; q2q2 = q2 * q2; q3q3 = q3 * q3;
+
+        /* Gradient descent corrective step (IMU - no mag) */
+        s0 = _4q0 * q2q2 + _2q2 * ax + _4q0 * q1q1 - _2q1 * ay;
+        s1 = _4q1 * q3q3 - _2q3 * ax + 4.f * q0q0 * q1 - _2q0 * ay - _4q1 + _8q1 * q1q1 + _8q1 * q2q2 + _4q1 * az;
+        s2 = 4.f * q0q0 * q2 + _2q0 * ax + _4q2 * q3q3 - _2q3 * ay - _4q2 + _8q2 * q1q1 + _8q2 * q2q2 + _4q2 * az;
+        s3 = 4.f * q1q1 * q3 - _2q1 * ax + 4.f * q2q2 * q3 - _2q2 * ay;
+        recip_norm = inv_sqrt(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3);
+        s0 *= recip_norm; s1 *= recip_norm; s2 *= recip_norm; s3 *= recip_norm;
+
+        q_dot1 -= x->fusiongain * s0;
+        q_dot2 -= x->fusiongain * s1;
+        q_dot3 -= x->fusiongain * s2;
+        q_dot4 -= x->fusiongain * s3;
+    }
+
+    /* Integrate */
+    q0 += q_dot1 * dt;
+    q1 += q_dot2 * dt;
+    q2 += q_dot3 * dt;
+    q3 += q_dot4 * dt;
+
+    recip_norm = inv_sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+    q0 *= recip_norm; q1 *= recip_norm; q2 *= recip_norm; q3 *= recip_norm;
+    /* Quaternion continuity: q and -q represent same rotation; avoid sign flip "jumps" */
     if (q0 * x->qw + q1 * x->qx + q2 * x->qy + q3 * x->qz < 0.f) {
         q0 = -q0; q1 = -q1; q2 = -q2; q3 = -q3;
     }
     x->qw = q0; x->qx = q1; x->qy = q2; x->qz = q3;
-
-    /* F matrix (simplified): identity + dt*A for quaternion part. P = F*P*F' + Q */
-    /* Use first-order approx: F ≈ I + dt*df/dx. For bias: F is identity. */
-    /* Process noise: quat ~ gyro ARW, bias ~ slow drift. Scale q_noise with sqrt(dt) for angle random walk. */
-    float *P = x->P;
-    float dt_safe = (dt > 0.f && dt <= 1.f) ? dt : 0.005f;
-    float q_noise = x->ekf_q * (float)sqrt((double)dt_safe) * 2.f;  /* ~angle random walk */
-    float b_noise = x->ekf_q * 0.02f;  /* allow bias to adapt when accel/mag disagree */
-    P[0*7+0] += q_noise; P[1*7+1] += q_noise;
-    P[2*7+2] += q_noise; P[3*7+3] += q_noise;
-    P[4*7+4] += b_noise; P[5*7+5] += b_noise; P[6*7+6] += b_noise;
 }
 
-/* EKF update with 3D vector measurement. z = measured (normalized), h = predicted from state. */
-static void ekf_update_vector(t_witmagic *x, const float *z, float bx, float by, float bz) {
-    float q0 = x->qw, q1 = x->qx, q2 = x->qy, q3 = x->qz;
-    float *P = x->P;
-    const float eps = 1e-5f;
-    float H[3 * EKF_N];  /* 3x7 */
-    float h0, h1, h2;
-
-    /* Predicted measurement: rotate reference [bx,by,bz] from world to body */
-    quat_rotate_inv(q0, q1, q2, q3, bx, by, bz, &h0, &h1, &h2);
-
-    /* Numerical Jacobian H = dh/dx. Perturb each state, recompute h. */
-    for (int j = 0; j < EKF_N; j++) {
-        float q0p = q0, q1p = q1, q2p = q2, q3p = q3;
-        if (j == 0) q0p += eps; else if (j == 1) q1p += eps; else if (j == 2) q2p += eps; else if (j == 3) q3p += eps;
-        float hp0, hp1, hp2;
-        quat_rotate_inv(q0p, q1p, q2p, q3p, bx, by, bz, &hp0, &hp1, &hp2);
-        H[0*7+j] = (hp0 - h0) / eps;
-        H[1*7+j] = (hp1 - h1) / eps;
-        H[2*7+j] = (hp2 - h2) / eps;
+/* Madgwick AHRS update (accel + gyro + magnetometer). Uses last stored mag when mag_valid.
+ * Mag corrects yaw drift. Falls back to IMU-only when mag invalid or zero. */
+static void madgwick_ahrs_update(t_witmagic *x, float gx, float gy, float gz,
+                                 float ax, float ay, float az, float dt) {
+    float mx = x->mag_x, my = x->mag_y, mz = x->mag_z;
+    if (!x->mag_valid || (mx == 0.f && my == 0.f && mz == 0.f)) {
+        madgwick_imu_update(x, gx, gy, gz, ax, ay, az, dt);
+        return;
     }
+    float q0 = x->qw, q1 = x->qx, q2 = x->qy, q3 = x->qz;
+    float recip_norm;
+    float s0, s1, s2, s3;
+    float q_dot1, q_dot2, q_dot3, q_dot4;
+    float _2q0, _2q1, _2q2, _2q3;
+    float _2q0mx, _2q0my, _2q0mz, _2q1mx;
+    float _2q0q2, _2q2q3, _2bx, _4bx, _2bz, _4bz;
+    float q0q0, q0q1, q0q2, q0q3, q1q1, q1q2, q1q3, q2q2, q2q3, q3q3;
 
-    /* Innovation y = z - h */
-    float y0 = z[0] - h0, y1 = z[1] - h1, y2 = z[2] - h2;
+    q_dot1 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz);
+    q_dot2 = 0.5f * (q0 * gx + q2 * gz - q3 * gy);
+    q_dot3 = 0.5f * (q0 * gy - q1 * gz + q3 * gx);
+    q_dot4 = 0.5f * (q0 * gz + q1 * gy - q2 * gx);
 
-    /* S = H*P*H' + R. R = (1/ekf_gain) * I for measurement noise */
-    float r = 0.1f / (x->ekf_gain > 0.01f ? x->ekf_gain : 0.01f);
-    float HP[3*7];
-    for (int i = 0; i < 3; i++)
-        for (int j = 0; j < 7; j++) {
-            HP[i*7+j] = 0;
-            for (int k = 0; k < 7; k++) HP[i*7+j] += H[i*7+k] * P[k*7+j];
-        }
-    float S[9];
-    for (int i = 0; i < 3; i++)
-        for (int j = 0; j < 3; j++) {
-            S[i*3+j] = (i==j ? r : 0);
-            for (int k = 0; k < 7; k++) S[i*3+j] += HP[i*7+k] * H[j*7+k];
-        }
-
-    float Si[9];
-    if (inv3x3(S, Si) != 0) return;
-
-    /* K = P*H'*inv(S) */
-    float PHt[7*3];
-    for (int i = 0; i < 7; i++)
-        for (int j = 0; j < 3; j++) {
-            PHt[i*3+j] = 0;
-            for (int k = 0; k < 7; k++) PHt[i*3+j] += P[i*7+k] * H[j*7+k];
-        }
-    float K[7*3];
-    for (int i = 0; i < 7; i++)
-        for (int j = 0; j < 3; j++) {
-            K[i*3+j] = 0;
-            for (int k = 0; k < 3; k++) K[i*3+j] += PHt[i*3+k] * Si[k*3+j];
-        }
-
-    /* x = x + K*y */
-    float dy0 = K[0*3+0]*y0 + K[0*3+1]*y1 + K[0*3+2]*y2;
-    float dy1 = K[1*3+0]*y0 + K[1*3+1]*y1 + K[1*3+2]*y2;
-    float dy2 = K[2*3+0]*y0 + K[2*3+1]*y1 + K[2*3+2]*y2;
-    float dy3 = K[3*3+0]*y0 + K[3*3+1]*y1 + K[3*3+2]*y2;
-    x->qw = q0 + dy0; x->qx = q1 + dy1; x->qy = q2 + dy2; x->qz = q3 + dy3;
-    x->bias_gx += K[4*3+0]*y0 + K[4*3+1]*y1 + K[4*3+2]*y2;
-    x->bias_gy += K[5*3+0]*y0 + K[5*3+1]*y1 + K[5*3+2]*y2;
-    x->bias_gz += K[6*3+0]*y0 + K[6*3+1]*y1 + K[6*3+2]*y2;
-
-    /* Renormalize quaternion */
-    float n = inv_sqrt(x->qw*x->qw + x->qx*x->qx + x->qy*x->qy + x->qz*x->qz);
-    x->qw *= n; x->qx *= n; x->qy *= n; x->qz *= n;
-
-    /* P = (I - K*H)*P */
-    float KH[7*7];
-    for (int i = 0; i < 7; i++)
-        for (int j = 0; j < 7; j++) {
-            KH[i*7+j] = 0;
-            for (int k = 0; k < 3; k++) KH[i*7+j] += K[i*3+k] * H[k*7+j];
-        }
-    float Pnew[49];
-    for (int i = 0; i < 7; i++)
-        for (int j = 0; j < 7; j++) {
-            Pnew[i*7+j] = (i==j ? 1 : 0) - KH[i*7+j];
-        }
-    float Ptmp[49];
-    for (int i = 0; i < 7; i++)
-        for (int j = 0; j < 7; j++) {
-            Ptmp[i*7+j] = 0;
-            for (int k = 0; k < 7; k++) Ptmp[i*7+j] += Pnew[i*7+k] * P[k*7+j];
-        }
-    memcpy(P, Ptmp, sizeof(Ptmp));
-}
-
-/* EKF AHRS update: prediction + accel update + mag update (when valid) */
-static void ekf_ahrs_update(t_witmagic *x, float gx, float gy, float gz,
-                            float ax, float ay, float az, float dt) {
     if (dt <= 0.f) dt = 0.001f;
 
-    /* First sample: init quaternion from accel when stationary (|accel| ≈ 1g) */
-    if (!x->ekf_initialized && (ax != 0.f || ay != 0.f || az != 0.f)) {
-        float acc_norm = (float)sqrt((double)(ax*ax + ay*ay + az*az));
-        if (acc_norm > 0.5f && acc_norm < 1.5f) {
-            float axn = ax / acc_norm, ayn = ay / acc_norm, azn = az / acc_norm;
-            /* Accel in body = gravity direction. We want q s.t. q* ⊗ [0,0,1] ⊗ q = [axn,ayn,azn].
-             * So [axn,ayn,azn] is "down" in body. One solution: q from identity to align z with accel. */
-            float zx = 0.f, zy = 0.f, zz = 1.f;
-            float dot = zx*axn + zy*ayn + zz*azn;
-            if (dot < 0.9999f) {
-                float rx = zy*azn - zz*ayn, ry = zz*axn - zx*azn, rz = zx*ayn - zy*axn;
-                float rn = inv_sqrt(rx*rx + ry*ry + rz*rz);
-                float angle = (float)acos((double)(dot < -1.f ? -1.f : (dot > 1.f ? 1.f : dot)));
-                float ha = (float)sin((double)(angle * 0.5));
-                x->qw = (float)cos((double)(angle * 0.5));
-                x->qx = rx * rn * ha;
-                x->qy = ry * rn * ha;
-                x->qz = rz * rn * ha;
-            }
-        }
-        x->ekf_initialized = 1;
-    }
-
-    ekf_predict(x, gx, gy, gz, dt);
-
-    /* Accel update: gravity in world = [0,0,1] */
     if (ax != 0.f || ay != 0.f || az != 0.f) {
-        float n = inv_sqrt(ax*ax + ay*ay + az*az);
-        float z[3] = { ax*n, ay*n, az*n };
-        ekf_update_vector(x, z, 0.f, 0.f, 1.f);
+        recip_norm = inv_sqrt(ax * ax + ay * ay + az * az);
+        ax *= recip_norm; ay *= recip_norm; az *= recip_norm;
+        recip_norm = inv_sqrt(mx * mx + my * my + mz * mz);
+        mx *= recip_norm; my *= recip_norm; mz *= recip_norm;
+
+        _2q0 = 2.f * q0; _2q1 = 2.f * q1; _2q2 = 2.f * q2; _2q3 = 2.f * q3;
+        _2q0mx = 2.f * q0 * mx; _2q0my = 2.f * q0 * my; _2q0mz = 2.f * q0 * mz;
+        _2q1mx = 2.f * q1 * mx;
+        _2q0q2 = 2.f * q0 * q2; _2q2q3 = 2.f * q2 * q3;
+        q0q0 = q0 * q0; q0q1 = q0 * q1; q0q2 = q0 * q2; q0q3 = q0 * q3;
+        q1q1 = q1 * q1; q1q2 = q1 * q2; q1q3 = q1 * q3;
+        q2q2 = q2 * q2; q2q3 = q2 * q3; q3q3 = q3 * q3;
+
+        /* Reference direction of Earth's magnetic field (mag rotated to world frame) */
+        {
+            float hx = mx * q0q0 - _2q0my * q3 + _2q0mz * q2 + mx * q1q1 + _2q1 * my * q2 + _2q1 * mz * q3 - mx * q2q2 - mx * q3q3;
+            float hy = _2q0mx * q3 + my * q0q0 - _2q0mz * q1 + _2q1mx * q2 - my * q1q1 + my * q2q2 + _2q2 * mz * q3 - my * q3q3;
+            _2bx = (float)sqrt((double)(hx * hx + hy * hy));
+            _2bz = -_2q0mx * q2 + _2q0my * q1 + mz * q0q0 + _2q1mx * q3 - mz * q1q1 + _2q2 * my * q3 - mz * q2q2 + mz * q3q3;
+        }
+        _4bx = 2.f * _2bx; _4bz = 2.f * _2bz;
+
+        /* Gradient descent (accel + mag) */
+        s0 = -_2q2 * (2.f * q1q3 - _2q0q2 - ax) + _2q1 * (2.f * q0q1 + _2q2q3 - ay)
+             - _2bz * q2 * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx)
+             + (-_2bx * q3 + _2bz * q1) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my)
+             + _2bx * q2 * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
+        s1 = _2q3 * (2.f * q1q3 - _2q0q2 - ax) + _2q0 * (2.f * q0q1 + _2q2q3 - ay)
+             - 4.f * q1 * (1.f - 2.f * q1q1 - 2.f * q2q2 - az)
+             + _2bz * q3 * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx)
+             + (_2bx * q2 + _2bz * q0) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my)
+             + (_2bx * q3 - _4bz * q1) * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
+        s2 = -_2q0 * (2.f * q1q3 - _2q0q2 - ax) + _2q3 * (2.f * q0q1 + _2q2q3 - ay)
+             - 4.f * q2 * (1.f - 2.f * q1q1 - 2.f * q2q2 - az)
+             + (-_4bx * q2 - _2bz * q0) * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx)
+             + (_2bx * q1 + _2bz * q3) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my)
+             + (_2bx * q0 - _4bz * q2) * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
+        s3 = _2q1 * (2.f * q1q3 - _2q0q2 - ax) + _2q2 * (2.f * q0q1 + _2q2q3 - ay)
+             + (-_4bx * q3 + _2bz * q1) * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx)
+             + (-_2bx * q0 + _2bz * q2) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my)
+             + _2bx * q1 * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
+        recip_norm = inv_sqrt(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3);
+        s0 *= recip_norm; s1 *= recip_norm; s2 *= recip_norm; s3 *= recip_norm;
+
+        q_dot1 -= x->fusiongain * s0;
+        q_dot2 -= x->fusiongain * s1;
+        q_dot3 -= x->fusiongain * s2;
+        q_dot4 -= x->fusiongain * s3;
     }
 
-    /* Mag update when valid */
-    if (x->mag_valid) {
-        float mx = x->mag_x, my = x->mag_y, mz = x->mag_z;
-        if (mx != 0.f || my != 0.f || mz != 0.f) {
-            float n = inv_sqrt(mx*mx + my*my + mz*mz);
-            mx *= n; my *= n; mz *= n;
-            /* Reference mag in world: project to horizontal like Madgwick */
-            float hx, hy, hz;
-            quat_rotate_vector(x->qw, x->qx, x->qy, x->qz, mx, my, mz, &hx, &hy, &hz);
-            float bx = (float)sqrt((double)(hx*hx + hy*hy));
-            float bz = hz;
-            if (bx < 1e-6f) bx = 1e-6f;
-            float z[3] = { mx, my, mz };
-            ekf_update_vector(x, z, bx, 0.f, bz);
-        }
+    q0 += q_dot1 * dt;
+    q1 += q_dot2 * dt;
+    q2 += q_dot3 * dt;
+    q3 += q_dot4 * dt;
+
+    recip_norm = inv_sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+    q0 *= recip_norm; q1 *= recip_norm; q2 *= recip_norm; q3 *= recip_norm;
+    if (q0 * x->qw + q1 * x->qx + q2 * x->qy + q3 * x->qz < 0.f) {
+        q0 = -q0; q1 = -q1; q2 = -q2; q3 = -q3;
     }
+    x->qw = q0; x->qx = q1; x->qy = q2; x->qz = q3;
 }
 
-/* Quaternion to Euler (ZYX) in degrees */
+/* Quaternion to Euler (ZYX: yaw pitch roll) in degrees. Z-up: yaw=heading, pitch=tilt, roll=bank. */
 static void quat_to_euler(float qw, float qx, float qy, float qz,
                           float *yaw, float *pitch, float *roll) {
     float sinp = 2.f * (qw * qy - qz * qx);
@@ -300,6 +236,18 @@ static void quat_to_euler(float qw, float qx, float qy, float qz,
     float siny_cosp = 2.f * (qw * qz + qx * qy);
     float cosy_cosp = 1.f - 2.f * (qy * qy + qz * qz);
     *yaw = (float)atan2((double)siny_cosp, (double)cosy_cosp) * RAD2DEG;
+}
+
+/* Rotate vector v by quaternion q: v' = q * v * q^-1 (vector part only) */
+static void quat_rotate_vector(float qw, float qx, float qy, float qz,
+                               float vx, float vy, float vz,
+                               float *out_x, float *out_y, float *out_z) {
+    float tx = 2.f * (qy * vz - qz * vy);
+    float ty = 2.f * (qz * vx - qx * vz);
+    float tz = 2.f * (qx * vy - qy * vx);
+    *out_x = vx + qw * tx + (qy * tz - qz * ty);
+    *out_y = vy + qw * ty + (qz * tx - qx * tz);
+    *out_z = vz + qw * tz + (qx * ty - qy * tx);
 }
 
 #ifdef _WIN32
@@ -317,8 +265,9 @@ static double get_time_sec(void) {
 }
 #endif
 
+/* Core processing: run pipeline for one sample. Calibration uses ax,ay,az when do_calibrate_next. */
 static void witmagic_process(t_witmagic *x, float ax, float ay, float az,
-                            float gx, float gy, float gz) {
+                              float gx, float gy, float gz) {
     float dt;
     if (x->rate_hz > 0.f) {
         dt = 1.f / x->rate_hz;
@@ -335,33 +284,41 @@ static void witmagic_process(t_witmagic *x, float ax, float ay, float az,
         }
     }
 
+    /* Calibrate: store accel offset (sensor flat, Z up). bias = raw - [0,0,1] so we preserve gravity. */
     if (x->do_calibrate_next) {
         x->bias_ax = ax;
         x->bias_ay = ay;
-        x->bias_az = az - 1.f;
+        x->bias_az = az - 1.f;  /* offset from 1g; assumes Z-up when calibrating */
         x->bias_valid = 1;
         x->do_calibrate_next = 0;
         post("witmagic: bias (offset) set to %.4g %.4g %.4g", x->bias_ax, x->bias_ay, x->bias_az);
     }
+    /* Subtract accel bias if calibrated */
     if (x->bias_valid) {
         ax -= x->bias_ax;
         ay -= x->bias_ay;
         az -= x->bias_az;
     }
 
+    /* Gyro: deg/s -> rad/s */
     gx *= DEG2RAD;
     gy *= DEG2RAD;
     gz *= DEG2RAD;
 
-    ekf_ahrs_update(x, gx, gy, gz, ax, ay, az, dt);
+    /* 1. Madgwick orientation filter (AHRS when mag valid, else IMU). Accel corrects pitch/roll; mag corrects yaw. */
+    madgwick_ahrs_update(x, gx, gy, gz, ax, ay, az, dt);
 
+    /* 2. Rotate accel into world frame (x/y horizontal, z vertical) */
     float aw_x, aw_y, aw_z;
     quat_rotate_vector(x->qw, x->qx, x->qy, x->qz, ax, ay, az, &aw_x, &aw_y, &aw_z);
 
+    /* 3. Subtract gravity (accel in g, so gravity = [0,0,1]). acclin adapts with orientation;
+     * higher fusiongain → faster quaternion → acclin responds faster to motion. */
     float ad_x = aw_x;
     float ad_y = aw_y;
     float ad_z = aw_z - 1.f;
 
+    /* 4. Integrate speed with leak (acclin in g → speed in mm/s via G_TO_MM_S2) */
     x->vx += ad_x * dt * G_TO_MM_S2;
     x->vy += ad_y * dt * G_TO_MM_S2;
     x->vz += ad_z * dt * G_TO_MM_S2;
@@ -369,6 +326,7 @@ static void witmagic_process(t_witmagic *x, float ax, float ay, float az,
     x->vy *= x->veldecay;
     x->vz *= x->veldecay;
 
+    /* Output: single outlet with named selectors (use [route] in Pd to dispatch) */
     t_atom out[4];
     SETFLOAT(out + 0, x->qw);
     SETFLOAT(out + 1, x->qx);
@@ -380,6 +338,7 @@ static void witmagic_process(t_witmagic *x, float ax, float ay, float az,
     yaw -= x->yaw_offset;
     while (yaw > 180.f) yaw -= 360.f;
     while (yaw < -180.f) yaw += 360.f;
+    /* euler: roll pitch yaw (x y z) — x=right, y=front, z=up; 3rd value = yaw */
     SETFLOAT(out + 0, roll);
     SETFLOAT(out + 1, pitch);
     SETFLOAT(out + 2, yaw);
@@ -392,12 +351,14 @@ static void witmagic_process(t_witmagic *x, float ax, float ay, float az,
     SETFLOAT(out + 1, x->vy);
     SETFLOAT(out + 2, x->vz);
     outlet_anything(x->o_out, gensym("speed"), 3, out);
+    /* Calibrated mag (min-max normalized) */
     SETFLOAT(out + 0, x->mag_x);
     SETFLOAT(out + 1, x->mag_y);
     SETFLOAT(out + 2, x->mag_z);
     outlet_anything(x->o_out, gensym("mag"), 3, out);
 }
 
+/* List: [ax ay az gx gy gz] (accel g, gyro deg/s). Mag via separate "mag" message. */
 static void witmagic_list(t_witmagic *x, t_symbol *s, int argc, t_atom *argv) {
     (void)s;
     if (argc < 6) return;
@@ -410,6 +371,7 @@ static void witmagic_list(t_witmagic *x, t_symbol *s, int argc, t_atom *argv) {
     witmagic_process(x, ax, ay, az, gx, gy, gz);
 }
 
+/* Accel: 3 floats (g). Store; no process until gyro arrives. */
 static void witmagic_accel(t_witmagic *x, t_symbol *s, int argc, t_atom *argv) {
     (void)s;
     if (argc < 3) return;
@@ -426,15 +388,72 @@ static void witmagic_accel(t_witmagic *x, t_symbol *s, int argc, t_atom *argv) {
     }
 }
 
+/* Mag: 3 floats (µT). Min-max calibrate if done. magcal 1/0: collect samples, compute offset+scale. */
 static void witmagic_mag(t_witmagic *x, t_symbol *s, int argc, t_atom *argv) {
     (void)s;
     if (argc < 3) return;
-    x->mag_x = atom_getfloat(argv + 0);
-    x->mag_y = atom_getfloat(argv + 1);
-    x->mag_z = atom_getfloat(argv + 2);
-    x->mag_valid = 1;
+    float mx = atom_getfloat(argv + 0);
+    float my = atom_getfloat(argv + 1);
+    float mz = atom_getfloat(argv + 2);
+    if (x->mag_cal_collecting) {
+        if (x->mag_cal_count == 0) {
+            x->mag_cal_min_x = x->mag_cal_max_x = mx;
+            x->mag_cal_min_y = x->mag_cal_max_y = my;
+            x->mag_cal_min_z = x->mag_cal_max_z = mz;
+        } else {
+            if (mx < x->mag_cal_min_x) x->mag_cal_min_x = mx;
+            if (mx > x->mag_cal_max_x) x->mag_cal_max_x = mx;
+            if (my < x->mag_cal_min_y) x->mag_cal_min_y = my;
+            if (my > x->mag_cal_max_y) x->mag_cal_max_y = my;
+            if (mz < x->mag_cal_min_z) x->mag_cal_min_z = mz;
+            if (mz > x->mag_cal_max_z) x->mag_cal_max_z = mz;
+        }
+        x->mag_cal_count++;
+    } else {
+        if (x->mag_cal_valid) {
+            float sx = (x->mag_scale_x > 1e-6f) ? x->mag_scale_x : 1.f;
+            float sy = (x->mag_scale_y > 1e-6f) ? x->mag_scale_y : 1.f;
+            float sz = (x->mag_scale_z > 1e-6f) ? x->mag_scale_z : 1.f;
+            mx = (mx - x->mag_offset_x) / sx;
+            my = (my - x->mag_offset_y) / sy;
+            mz = (mz - x->mag_offset_z) / sz;
+        }
+        x->mag_x = mx;
+        x->mag_y = my;
+        x->mag_z = mz;
+        x->mag_valid = 1;
+    }
 }
 
+static void witmagic_magcal(t_witmagic *x, t_floatarg f) {
+    if (f != 0.f) {
+        x->mag_cal_collecting = 1;
+        x->mag_cal_count = 0;
+        x->mag_cal_valid = 0;
+        post("witmagic: magcal started — rotate sensor through all orientations, then magcal 0");
+    } else {
+        x->mag_cal_collecting = 0;
+        if (x->mag_cal_count > 0) {
+            x->mag_offset_x = 0.5f * (x->mag_cal_min_x + x->mag_cal_max_x);
+            x->mag_offset_y = 0.5f * (x->mag_cal_min_y + x->mag_cal_max_y);
+            x->mag_offset_z = 0.5f * (x->mag_cal_min_z + x->mag_cal_max_z);
+            x->mag_scale_x = 0.5f * (x->mag_cal_max_x - x->mag_cal_min_x);
+            x->mag_scale_y = 0.5f * (x->mag_cal_max_y - x->mag_cal_min_y);
+            x->mag_scale_z = 0.5f * (x->mag_cal_max_z - x->mag_cal_min_z);
+            if (x->mag_scale_x < 1e-6f) x->mag_scale_x = 1.f;
+            if (x->mag_scale_y < 1e-6f) x->mag_scale_y = 1.f;
+            if (x->mag_scale_z < 1e-6f) x->mag_scale_z = 1.f;
+            x->mag_cal_valid = 1;
+            post("witmagic: mag min-max cal done — offset (%.1f %.1f %.1f) scale (%.1f %.1f %.1f) (%d samples)",
+                 x->mag_offset_x, x->mag_offset_y, x->mag_offset_z,
+                 x->mag_scale_x, x->mag_scale_y, x->mag_scale_z, x->mag_cal_count);
+        } else {
+            post("witmagic: magcal stopped — no samples collected");
+        }
+    }
+}
+
+/* Gyro: 3 floats (deg/s). Process with last accel. */
 static void witmagic_gyro(t_witmagic *x, t_symbol *s, int argc, t_atom *argv) {
     (void)s;
     if (argc < 3) return;
@@ -444,6 +463,7 @@ static void witmagic_gyro(t_witmagic *x, t_symbol *s, int argc, t_atom *argv) {
     witmagic_process(x, x->last_ax, x->last_ay, x->last_az, gx, gy, gz);
 }
 
+/* xyzero: when sensor is flat (Z up), set accel offset so pitch/roll → 0 */
 static void witmagic_xyzero(t_witmagic *x) {
     x->vx = x->vy = x->vz = 0.f;
     x->do_calibrate_next = 1;
@@ -452,15 +472,11 @@ static void witmagic_xyzero(t_witmagic *x) {
 
 static void witmagic_rate(t_witmagic *x, t_floatarg f) {
     x->rate_hz = (f > 0.f && f <= 1000.f) ? f : 0.f;
-    if (x->rate_hz == 0.f) x->first_sample = 1;
+    if (x->rate_hz == 0.f) x->first_sample = 1;  /* reinit wall-clock on next sample */
 }
 
-static void witmagic_ekf_gain(t_witmagic *x, t_floatarg f) {
-    if (f >= WITMAGIC_EKF_GAIN_MIN && f <= WITMAGIC_EKF_GAIN_MAX) x->ekf_gain = f;
-}
-
-static void witmagic_ekf_q(t_witmagic *x, t_floatarg f) {
-    if (f > 0.f) x->ekf_q = f;
+static void witmagic_fusiongain(t_witmagic *x, t_floatarg f) {
+    if (f >= WITMAGIC_FUSIONGAIN_MIN && f <= WITMAGIC_FUSIONGAIN_MAX) x->fusiongain = f;
 }
 
 static void witmagic_veldecay(t_witmagic *x, t_floatarg f) {
@@ -468,6 +484,7 @@ static void witmagic_veldecay(t_witmagic *x, t_floatarg f) {
 }
 
 static void witmagic_anything(t_witmagic *x, t_symbol *s, int argc, t_atom *argv) {
+    /* don't pass through — we output improved versions */
     if (s == gensym("angle") || s == gensym("speed") || s == gensym("disp") || s == gensym("quat"))
         return;
     outlet_anything(x->o_out, s, argc, argv);
@@ -475,16 +492,12 @@ static void witmagic_anything(t_witmagic *x, t_symbol *s, int argc, t_atom *argv
 
 static void witmagic_reset(t_witmagic *x) {
     x->qw = 1.f; x->qx = x->qy = x->qz = 0.f;
-    x->bias_gx = x->bias_gy = x->bias_gz = 0.f;
     x->vx = x->vy = x->vz = 0.f;
     x->yaw_offset = 0.f;
     x->first_sample = 1;
-    x->ekf_initialized = 0;
-    /* Reset P to initial */
-    for (int i = 0; i < EKF_N * EKF_N; i++) x->P[i] = 0.f;
-    for (int i = 0; i < EKF_N; i++) x->P[i * EKF_N + i] = 0.01f;
 }
 
+/* zzero: set current heading as 0. Accel/mag keep correcting; only yaw reference changes. */
 static void witmagic_zzero(t_witmagic *x) {
     float yaw, pitch, roll;
     quat_to_euler(x->qw, x->qx, x->qy, x->qz, &yaw, &pitch, &roll);
@@ -496,9 +509,7 @@ static void *witmagic_new(void) {
     t_witmagic *x = (t_witmagic *)pd_new(witmagic_class);
     x->qw = 1.f;
     x->qx = x->qy = x->qz = 0.f;
-    x->bias_gx = x->bias_gy = x->bias_gz = 0.f;
-    x->ekf_gain = WITMAGIC_EKF_GAIN_DEF;
-    x->ekf_q = WITMAGIC_EKF_Q_DEF;
+    x->fusiongain = WITMAGIC_FUSIONGAIN_DEF;
     x->veldecay = WITMAGIC_VELDECAY_DEF;
     x->bias_ax = x->bias_ay = x->bias_az = 0.f;
     x->bias_valid = 0;
@@ -510,10 +521,12 @@ static void *witmagic_new(void) {
     x->last_ax = x->last_ay = x->last_az = 0.f;
     x->mag_x = x->mag_y = x->mag_z = 0.f;
     x->mag_valid = 0;
+    x->mag_offset_x = x->mag_offset_y = x->mag_offset_z = 0.f;
+    x->mag_scale_x = x->mag_scale_y = x->mag_scale_z = 1.f;
+    x->mag_cal_valid = 0;
+    x->mag_cal_collecting = 0;
+    x->mag_cal_count = 0;
     x->yaw_offset = 0.f;
-    x->ekf_initialized = 0;
-    for (int i = 0; i < EKF_N * EKF_N; i++) x->P[i] = 0.f;
-    for (int i = 0; i < EKF_N; i++) x->P[i * EKF_N + i] = 0.01f;
 
     x->o_out = outlet_new(&x->x_obj, &s_anything);
     return (void *)x;
@@ -528,10 +541,10 @@ void witmagic_setup(void) {
     class_addmethod(witmagic_class, (t_method)witmagic_mag, gensym("mag"), A_GIMME, 0);
     class_addmethod(witmagic_class, (t_method)witmagic_rate, gensym("rate"), A_DEFFLOAT, 0);
     class_addmethod(witmagic_class, (t_method)witmagic_xyzero, gensym("xyzero"), 0);
-    class_addmethod(witmagic_class, (t_method)witmagic_ekf_gain, gensym("ekf_gain"), A_DEFFLOAT, 0);
-    class_addmethod(witmagic_class, (t_method)witmagic_ekf_q, gensym("ekf_q"), A_DEFFLOAT, 0);
+    class_addmethod(witmagic_class, (t_method)witmagic_fusiongain, gensym("fusiongain"), A_DEFFLOAT, 0);
     class_addmethod(witmagic_class, (t_method)witmagic_veldecay, gensym("veldecay"), A_DEFFLOAT, 0);
     class_addmethod(witmagic_class, (t_method)witmagic_reset, gensym("reset"), 0);
     class_addmethod(witmagic_class, (t_method)witmagic_zzero, gensym("zzero"), 0);
+    class_addmethod(witmagic_class, (t_method)witmagic_magcal, gensym("magcal"), A_DEFFLOAT, 0);
     class_addmethod(witmagic_class, (t_method)witmagic_anything, gensym("anything"), A_GIMME, 0);
 }

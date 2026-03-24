@@ -4,8 +4,9 @@ lib.name = witsensor
 # Default macOS minimum versions for local builds (use these names — not MACOSX_DEPLOYMENT_*,
 # which Xcode often exports empty and would break ?= defaults).
 # Override: MACOSX_DEPLOYMENT_TARGET, or WITSENSOR_MACOSX_INTEL_MIN / WITSENSOR_MACOSX_ARM64_MIN.
-# Apple Silicon binaries cannot target macOS 10.x; Intel can (e.g. 10.14 Mojave).
-WITSENSOR_MACOSX_INTEL_MIN := 10.14
+# Apple Silicon binaries cannot target macOS 10.x. Intel: SimpleBLE uses CoreBluetooth
+# authorization + NSDate.now (macOS 10.15+); 10.14 is not consistent with that code.
+WITSENSOR_MACOSX_INTEL_MIN := 10.15
 WITSENSOR_MACOSX_ARM64_MIN := 11.0
 
 # Helper variables for Makefile string manipulation

@@ -49,9 +49,9 @@ jobs:
         os: [darwin]
         arch: [amd64, arm64]
         floatsize: [32, 64]
-    # Intel: target 10.14+; Apple Silicon arm64 cannot target 10.x (minimum 11.0).
+    # Intel: 10.15+ (SimpleBLE macOS backend); arm64 minimum 11.0.
     env:
-      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.arch == 'arm64' && '11.0' || '10.14' }}
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.arch == 'arm64' && '11.0' || '10.15' }}
     steps:
       - uses: actions/checkout@v4
         with:
