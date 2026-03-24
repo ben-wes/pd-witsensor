@@ -981,9 +981,9 @@
 #X text 393 113 stream output modes;
 #X text 150 38 - connect to WitMotion WT9011DCL-BT50 sensor via Bluetooth Low Energy (BLE), f 75;
 #N canvas 462 293 362 133 creation 0;
-#X text 21 63 -dejitter: activate de-jittering;
-#X text 21 81 -listmode: output one list for all streamed data;
-#X text 23 24 witsensor currently supports 2 flags:;
+#X text 21 63 -dejitter / -j: activate de-jittering;
+#X text 21 81 -listmode / -l: output one list for all streamed data;
+#X text 23 24 witsensor supports these creation flags:;
 #X restore 397 313 pd creation args;
 #X obj 24 213 witsensor;
 #X obj 24 352 r \$0-out;

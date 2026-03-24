@@ -1698,9 +1698,9 @@ static void *witsensor_new(t_symbol *s, int argc, t_atom *argv) {
     for (int i = 0; i < argc; i++) {
         if (argv[i].a_type == A_SYMBOL) {
             const char *flag = atom_getsymbol(&argv[i])->s_name;
-            if (!strcmp(flag, "-dejitter"))
+            if (!strcmp(flag, "-dejitter") || !strcmp(flag, "-j"))
                 x->stream_dejitter = 1;
-            else if (!strcmp(flag, "-listmode"))
+            else if (!strcmp(flag, "-listmode") || !strcmp(flag, "-l"))
                 x->stream_listmode = 1;
             else
                 pd_error(x, "witsensor: unknown argument '%s'", flag);
