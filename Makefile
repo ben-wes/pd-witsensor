@@ -18,11 +18,16 @@ cflags = -I. -I./SimpleBLE/simplecble/include -I./SimpleBLE/simpleble/include -I
 ldlibs = -lpthread -lm
 
 # platform-specific settings - SimpleBLE for all platforms
+# pd-lib-builder: any -mmacosx-version-min= in cflags becomes version.flag (link + compile).
+# Override default: env or make MACOSX_DEPLOYMENT_TARGET=10.13 (Intel); arm64 needs 11.0+.
 define forDarwin
-	# Link against static libs built by SimpleBLE (no runtime dylib needed)
-	ldlibs += -L./SimpleBLE/simplecble/build-static/lib -Wl,-force_load,./SimpleBLE/simplecble/build-static/lib/libsimplecble.a -Wl,-force_load,./SimpleBLE/simplecble/build-static/lib/libsimpleble.a -framework CoreBluetooth -framework Foundation
-	# Include Objective-C helper for all macOS builds (needed for Bluetooth permissions)
-	witsensor.class.sources += macos_bt_auth.m
+ifndef MACOSX_DEPLOYMENT_TARGET
+MACOSX_DEPLOYMENT_TARGET := $(if $(filter arm64,$(arch)),11.0,$(if $(filter x86_64,$(arch)),10.14,$(if $(filter arm64,$(shell uname -m)),11.0,10.14)))
+endif
+export MACOSX_DEPLOYMENT_TARGET
+cflags += -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET)
+ldlibs += -L./SimpleBLE/simplecble/build-static/lib -Wl,-force_load,./SimpleBLE/simplecble/build-static/lib/libsimplecble.a -Wl,-force_load,./SimpleBLE/simplecble/build-static/lib/libsimpleble.a -framework CoreBluetooth -framework Foundation
+witsensor.class.sources += macos_bt_auth.m
 endef
 
 define forLinux
@@ -51,27 +56,27 @@ include $(PDLIBBUILDER_DIR)/Makefile.pdlibbuilder
 
 # Build Objective-C helper for all architectures (place AFTER include so 'all' stays default)
 macos_bt_auth.d_amd64.o: macos_bt_auth.m
-	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -arch x86_64 -mmacosx-version-min=10.6 -c macos_bt_auth.m -o macos_bt_auth.d_amd64.o
+	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -arch x86_64 -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET) -c macos_bt_auth.m -o macos_bt_auth.d_amd64.o
 
 macos_bt_auth.d_arm64.o: macos_bt_auth.m
-	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -arch arm64 -mmacosx-version-min=10.6 -c macos_bt_auth.m -o macos_bt_auth.d_arm64.o
+	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -arch arm64 -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET) -c macos_bt_auth.m -o macos_bt_auth.d_arm64.o
 
 # Build rules for shared library extensions
 macos_bt_auth.darwin-amd64-64.so.o: macos_bt_auth.m
-	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -arch x86_64 -mmacosx-version-min=10.6 -c macos_bt_auth.m -o macos_bt_auth.darwin-amd64-64.so.o
+	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -arch x86_64 -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET) -c macos_bt_auth.m -o macos_bt_auth.darwin-amd64-64.so.o
 
 macos_bt_auth.darwin-arm64-64.so.o: macos_bt_auth.m
-	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -arch arm64 -mmacosx-version-min=10.6 -c macos_bt_auth.m -o macos_bt_auth.darwin-arm64-64.so.o
+	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -arch arm64 -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET) -c macos_bt_auth.m -o macos_bt_auth.darwin-arm64-64.so.o
 
 macos_bt_auth.darwin-amd64-32.so.o: macos_bt_auth.m
-	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -arch x86_64 -mmacosx-version-min=10.6 -c macos_bt_auth.m -o macos_bt_auth.darwin-amd64-32.so.o
+	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -arch x86_64 -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET) -c macos_bt_auth.m -o macos_bt_auth.darwin-amd64-32.so.o
 
 macos_bt_auth.darwin-arm64-32.so.o: macos_bt_auth.m
-	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -arch arm64 -mmacosx-version-min=10.6 -c macos_bt_auth.m -o macos_bt_auth.darwin-arm64-32.so.o
+	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -arch arm64 -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET) -c macos_bt_auth.m -o macos_bt_auth.darwin-arm64-32.so.o
 
 # Build rule for generic pd_darwin extension (local builds)
 macos_bt_auth.pd_darwin.o: macos_bt_auth.m
-	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -mmacosx-version-min=10.6 -c macos_bt_auth.m -o macos_bt_auth.pd_darwin.o
+	cc -DPD -I "$(PDINCLUDEDIR)" -Wall -Wextra -O3 -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET) -c macos_bt_auth.m -o macos_bt_auth.pd_darwin.o
 
 # SimpleBLE dependencies (build static for macOS and shared for Linux)
 SIMPLEBLE_DIR=SimpleBLE/simplecble
@@ -108,7 +113,7 @@ endif
 
 $(SIMPLEBLE_STATIC_LIBS):
 	# Build SimpleBLE for the target architecture(s). Convert space-separated arch list to semicolon-separated for CMake.
-	cd $(SIMPLEBLE_DIR) && cmake -S . -B build-static -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF $(if $(arch),-DCMAKE_OSX_ARCHITECTURES="$(subst $(space),;,$(arch))",)
+	cd $(SIMPLEBLE_DIR) && cmake -S . -B build-static -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET="$(MACOSX_DEPLOYMENT_TARGET)" $(if $(arch),-DCMAKE_OSX_ARCHITECTURES="$(subst $(space),;,$(arch))",)
 	$(MAKE) -C $(SIMPLEBLE_STATIC_DIR) -j$(shell sysctl -n hw.ncpu 2>/dev/null || nproc)
 
 $(SIMPLEBLE_SHARED_LIBS):
