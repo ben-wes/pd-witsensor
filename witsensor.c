@@ -1889,11 +1889,9 @@ static void witsensor_magcal(t_witsensor *x, t_floatarg f) {
 
 static void witsensor_zzero(t_witsensor *x) {
     if (!witsensor_ensure_connected(x)) return;
-    unsigned char cmd_unlock[] = {0xFF, 0xAA, 0x69, 0x88, 0xB5};
-    witsensor_ble_simpleble_write_data(x->ble_data, cmd_unlock, sizeof(cmd_unlock));
+    /* FF AA 01 04 00 = CALSW: set heading angle (Z) to zero. */
     unsigned char cmd_zeroz[] = {0xFF, 0xAA, 0x01, 0x04, 0x00};
     witsensor_ble_simpleble_write_data(x->ble_data, cmd_zeroz, sizeof(cmd_zeroz));
-    outlet_anything(x->status_out, gensym("zzero"), 0, NULL);
 }
 
 // Version info
