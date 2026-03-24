@@ -64,16 +64,11 @@ struct _dejitter_node {
 #define M_PI 3.14159265358979323846
 #endif
 
-/* Gyro/angle outlet normalization: internal state stays ° and °/s; multiply by scale at outlet. */
-typedef enum {
-    WITSENSOR_ANGLENORM_DEG = 0,
-    WITSENSOR_ANGLENORM_RAD,
-    WITSENSOR_ANGLENORM_CYCLES
-} t_witsensor_anglenorm;
-
-#define WITSENSOR_ANGLENORM_SCALE_DEG     (1.0)
-#define WITSENSOR_ANGLENORM_SCALE_RAD     (M_PI / 180.0)
-#define WITSENSOR_ANGLENORM_SCALE_CYCLES  (1.0 / 360.0)
+/* Gyro/angle outlet normalization: internal state stays ° and °/s; multiply anglenorm_scale at outlet.
+ * Only "radians" and "turns" change the scale; anything else (incl. bare message) → degrees. */
+#define WITSENSOR_ANGLE_SCALE_DEG    (1.0)
+#define WITSENSOR_ANGLE_SCALE_RAD    (M_PI / 180.0)
+#define WITSENSOR_ANGLE_SCALE_TURNS  (1.0 / 360.0)
 
 typedef struct _witsensor {
     t_object x_obj;
@@ -136,8 +131,7 @@ typedef struct _witsensor {
     int stream_listmode; // 0 = separate messages per group; 1 = one list
     int stream_dejitter; // 1 = buffer streaming packets and output at even intervals
     int dejitter_debug;
-    t_witsensor_anglenorm anglenorm_mode;
-    double anglenorm_scale; /* outlet = (double)° or °/s * this; see WITSENSOR_ANGLENORM_SCALE_* */
+    double anglenorm_scale; /* outlet = (double)° or °/s * this; see WITSENSOR_ANGLE_SCALE_* */
 
     // Dejitter state
     t_float stream_dejitter_rate;     // sensor output rate in Hz (from query / set)
@@ -207,6 +201,7 @@ static void witsensor_set_bandwidth(t_witsensor *x, t_float hz);
 static void witsensor_set_axis(t_witsensor *x, t_float axis_count);
 static void witsensor_set_output_mode(t_witsensor *x, t_floatarg mode);
 static int witsensor_ensure_connected(t_witsensor *x);
+static void witsensor_anglenorm_emit_status(t_witsensor *x);
 // pd_queue_mess marshaling
 typedef struct _queued_output { 
     t_symbol *msg; 
@@ -757,7 +752,7 @@ static void witsensor_ts_to_sec_ms(unsigned short ts_hi, unsigned short ts_lo, i
     *ms_out = (int)(ms % 1000);
 }
 
-/* ° and °/s use the same outlet scale (rad vs cycles); multiply in double then cast to t_float. */
+/* ° and °/s use the same outlet scale (rad vs turns); multiply in double then cast to t_float. */
 static t_float witsensor_anglenorm_out(t_witsensor *x, t_float v_deg) {
     if (!x) return v_deg;
     return (t_float)((double)v_deg * x->anglenorm_scale);
@@ -1093,6 +1088,8 @@ void witsensor_pd_connected_handler(t_pd *obj, void *data) {
             outlet_anything(x->status_out, gensym("name"), 1, &an);
         }
     }
+    if (flag->value)
+        witsensor_anglenorm_emit_status(x);
     
     if (flag->value) {
         witsensor_query_config(x);
@@ -1186,6 +1183,7 @@ static void witsensor_connect(t_witsensor *x, t_symbol *s, int argc, t_atom *arg
                 t_atom an; SETSYMBOL(&an, gensym(id_buf));
                 outlet_anything(x->status_out, gensym("name"), 1, &an);
             }
+            witsensor_anglenorm_emit_status(x);
             if (!has_any_pending_target() && witsensor_ble_simpleble_is_any_scanning())
                 witsensor_ble_simpleble_stop_scanning(x->ble_data);
         } else {
@@ -1242,6 +1240,27 @@ static void witsensor_dejitter(t_witsensor *x, t_floatarg f) {
     }
     x->dejitter_tail = NULL;
     x->dejitter_count = 0;
+}
+
+/* Status outlet: turnrange <one-turn> — outlet span for 360° internal rotation (360° \, 2π rad \, or 1 turn). */
+static void witsensor_anglenorm_emit_status(t_witsensor *x) {
+    t_atom a;
+    SETFLOAT(&a, (t_float)(x->anglenorm_scale * 360.0));
+    outlet_anything(x->status_out, gensym("turnrange"), 1, &a);
+}
+
+static void witsensor_anglenorm(t_witsensor *x, t_symbol *s, int argc, t_atom *argv) {
+    (void)s;
+    double scale = WITSENSOR_ANGLE_SCALE_DEG;
+    if (argc >= 1 && argv[0].a_type == A_SYMBOL) {
+        t_symbol *sym = atom_getsymbol(argv + 0);
+        if (sym == gensym("radians"))
+            scale = WITSENSOR_ANGLE_SCALE_RAD;
+        else if (sym == gensym("turns"))
+            scale = WITSENSOR_ANGLE_SCALE_TURNS;
+    }
+    x->anglenorm_scale = scale;
+    witsensor_anglenorm_emit_status(x);
 }
 
 static void witsensor_set_rate(t_witsensor *x, t_float rate) {
@@ -1718,8 +1737,7 @@ static void *witsensor_new(t_symbol *s, int argc, t_atom *argv) {
     x->dejitter_head = x->dejitter_tail = NULL;
     x->dejitter_count = 0;
     x->dejitter_debug = 0;
-    x->anglenorm_mode = WITSENSOR_ANGLENORM_DEG;
-    x->anglenorm_scale = WITSENSOR_ANGLENORM_SCALE_DEG;
+    x->anglenorm_scale = WITSENSOR_ANGLE_SCALE_DEG;
 
     for (int i = 0; i < argc; i++) {
         if (argv[i].a_type == A_SYMBOL) {
@@ -1728,13 +1746,10 @@ static void *witsensor_new(t_symbol *s, int argc, t_atom *argv) {
                 x->stream_dejitter = 1;
             else if (!strcmp(flag, "-listmode") || !strcmp(flag, "-l"))
                 x->stream_listmode = 1;
-            else if (!strcmp(flag, "-nr")) {
-                x->anglenorm_mode = WITSENSOR_ANGLENORM_RAD;
-                x->anglenorm_scale = WITSENSOR_ANGLENORM_SCALE_RAD;
-            } else if (!strcmp(flag, "-n") || !strcmp(flag, "-nc")) {
-                x->anglenorm_mode = WITSENSOR_ANGLENORM_CYCLES;
-                x->anglenorm_scale = WITSENSOR_ANGLENORM_SCALE_CYCLES;
-            }
+            else if (!strcmp(flag, "-nr"))
+                x->anglenorm_scale = WITSENSOR_ANGLE_SCALE_RAD;
+            else if (!strcmp(flag, "-n") || !strcmp(flag, "-nc"))
+                x->anglenorm_scale = WITSENSOR_ANGLE_SCALE_TURNS;
             else
                 pd_error(x, "witsensor: unknown argument '%s'", flag);
         } else {
@@ -1954,6 +1969,7 @@ void witsensor_setup(void) {
     class_addmethod(witsensor_class, (t_method)witsensor_poll, gensym("poll"), A_SYMBOL, A_DEFFLOAT, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_listmode, gensym("listmode"), A_DEFFLOAT, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_dejitter, gensym("dejitter"), A_DEFFLOAT, 0);
+    class_addmethod(witsensor_class, (t_method)witsensor_anglenorm, gensym("anglenorm"), A_GIMME, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_debug_queue, gensym("debug-queue"), A_DEFFLOAT, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_set_cmd, gensym("set"), A_GIMME, 0);
     class_addmethod(witsensor_class, (t_method)witsensor_get_cmd, gensym("get"), A_GIMME, 0);
