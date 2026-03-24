@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 // Platform-specific includes
 #ifndef _WIN32
@@ -58,6 +59,21 @@ struct _dejitter_node {
 #define DEJITTER_DRIFT_GAIN_FAST 0.001f  /* correct quickly when queue is draining (prevent underrun) */
 #define DEJITTER_DRIFT_GAIN_SLOW 0.0001f /* correct gently when queue is growing (minimize jitter) */
 #define DEJITTER_IDLE_TIMEOUT_MS 200  /* stop clock after this long with empty queue */
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+/* Gyro/angle outlet normalization: internal state stays ° and °/s; multiply by scale at outlet. */
+typedef enum {
+    WITSENSOR_ANGLENORM_DEG = 0,
+    WITSENSOR_ANGLENORM_RAD,
+    WITSENSOR_ANGLENORM_CYCLES
+} t_witsensor_anglenorm;
+
+#define WITSENSOR_ANGLENORM_SCALE_DEG     (1.0)
+#define WITSENSOR_ANGLENORM_SCALE_RAD     (M_PI / 180.0)
+#define WITSENSOR_ANGLENORM_SCALE_CYCLES  (1.0 / 360.0)
 
 typedef struct _witsensor {
     t_object x_obj;
@@ -120,6 +136,8 @@ typedef struct _witsensor {
     int stream_listmode; // 0 = separate messages per group; 1 = one list
     int stream_dejitter; // 1 = buffer streaming packets and output at even intervals
     int dejitter_debug;
+    t_witsensor_anglenorm anglenorm_mode;
+    double anglenorm_scale; /* outlet = (double)° or °/s * this; see WITSENSOR_ANGLENORM_SCALE_* */
 
     // Dejitter state
     t_float stream_dejitter_rate;     // sensor output rate in Hz (from query / set)
@@ -739,6 +757,12 @@ static void witsensor_ts_to_sec_ms(unsigned short ts_hi, unsigned short ts_lo, i
     *ms_out = (int)(ms % 1000);
 }
 
+/* ° and °/s use the same outlet scale (rad vs cycles); multiply in double then cast to t_float. */
+static t_float witsensor_anglenorm_out(t_witsensor *x, t_float v_deg) {
+    if (!x) return v_deg;
+    return (t_float)((double)v_deg * x->anglenorm_scale);
+}
+
 /* Send sensor data from a queued snapshot. If stream_listmode: one list. Timestamp is seconds + ms (two values) to avoid Pd 1e6 display. */
 static void witsensor_send_sensor_data_from_snapshot(t_witsensor *x, const t_queued_streaming *snap) {
     int ts_sec, ts_ms;
@@ -756,19 +780,19 @@ static void witsensor_send_sensor_data_from_snapshot(t_witsensor *x, const t_que
                 SETFLOAT(&a[3], snap->speed_x);
                 SETFLOAT(&a[4], snap->speed_y);
                 SETFLOAT(&a[5], snap->speed_z);
-                SETFLOAT(&a[6], snap->angle_x);
-                SETFLOAT(&a[7], snap->angle_y);
-                SETFLOAT(&a[8], snap->angle_z);
+                SETFLOAT(&a[6], witsensor_anglenorm_out(x, snap->angle_x));
+                SETFLOAT(&a[7], witsensor_anglenorm_out(x, snap->angle_y));
+                SETFLOAT(&a[8], witsensor_anglenorm_out(x, snap->angle_z));
             } else {
                 SETFLOAT(&a[0], snap->accel_x);
                 SETFLOAT(&a[1], snap->accel_y);
                 SETFLOAT(&a[2], snap->accel_z);
-                SETFLOAT(&a[3], snap->gyro_x);
-                SETFLOAT(&a[4], snap->gyro_y);
-                SETFLOAT(&a[5], snap->gyro_z);
-                SETFLOAT(&a[6], snap->angle_x);
-                SETFLOAT(&a[7], snap->angle_y);
-                SETFLOAT(&a[8], snap->angle_z);
+                SETFLOAT(&a[3], witsensor_anglenorm_out(x, snap->gyro_x));
+                SETFLOAT(&a[4], witsensor_anglenorm_out(x, snap->gyro_y));
+                SETFLOAT(&a[5], witsensor_anglenorm_out(x, snap->gyro_z));
+                SETFLOAT(&a[6], witsensor_anglenorm_out(x, snap->angle_x));
+                SETFLOAT(&a[7], witsensor_anglenorm_out(x, snap->angle_y));
+                SETFLOAT(&a[8], witsensor_anglenorm_out(x, snap->angle_z));
             }
         } else {
             n = 9;
@@ -781,17 +805,17 @@ static void witsensor_send_sensor_data_from_snapshot(t_witsensor *x, const t_que
                 SETFLOAT(&a[5], snap->speed_z);
                 SETFLOAT(&a[6], (t_float)ts_sec);
                 SETFLOAT(&a[7], (t_float)ts_ms);
-                SETFLOAT(&a[8], snap->angle_z);
+                SETFLOAT(&a[8], witsensor_anglenorm_out(x, snap->angle_z));
             } else {
                 SETFLOAT(&a[0], snap->accel_x);
                 SETFLOAT(&a[1], snap->accel_y);
                 SETFLOAT(&a[2], snap->accel_z);
-                SETFLOAT(&a[3], snap->gyro_x);
-                SETFLOAT(&a[4], snap->gyro_y);
-                SETFLOAT(&a[5], snap->gyro_z);
+                SETFLOAT(&a[3], witsensor_anglenorm_out(x, snap->gyro_x));
+                SETFLOAT(&a[4], witsensor_anglenorm_out(x, snap->gyro_y));
+                SETFLOAT(&a[5], witsensor_anglenorm_out(x, snap->gyro_z));
                 SETFLOAT(&a[6], (t_float)ts_sec);
                 SETFLOAT(&a[7], (t_float)ts_ms);
-                SETFLOAT(&a[8], snap->angle_z);
+                SETFLOAT(&a[8], witsensor_anglenorm_out(x, snap->angle_z));
             }
         }
         outlet_anything(x->data_out, gensym("list"), n, a);
@@ -812,9 +836,9 @@ static void witsensor_send_sensor_data_from_snapshot(t_witsensor *x, const t_que
         SETFLOAT(&args[1], snap->accel_y);
         SETFLOAT(&args[2], snap->accel_z);
         outlet_anything(x->data_out, gensym("accel"), 3, args);
-        SETFLOAT(&args[0], snap->gyro_x);
-        SETFLOAT(&args[1], snap->gyro_y);
-        SETFLOAT(&args[2], snap->gyro_z);
+        SETFLOAT(&args[0], witsensor_anglenorm_out(x, snap->gyro_x));
+        SETFLOAT(&args[1], witsensor_anglenorm_out(x, snap->gyro_y));
+        SETFLOAT(&args[2], witsensor_anglenorm_out(x, snap->gyro_z));
         outlet_anything(x->data_out, gensym("gyro"), 3, args);
     }
     if (snap->use_timestamp) {
@@ -823,12 +847,12 @@ static void witsensor_send_sensor_data_from_snapshot(t_witsensor *x, const t_que
         outlet_anything(x->data_out, gensym("ts"), 2, args);
         SETFLOAT(&args[0], 0);
         SETFLOAT(&args[1], 0);
-        SETFLOAT(&args[2], snap->angle_z);
+        SETFLOAT(&args[2], witsensor_anglenorm_out(x, snap->angle_z));
         outlet_anything(x->data_out, gensym("angle"), 3, args);
     } else {
-        SETFLOAT(&args[0], snap->angle_x);
-        SETFLOAT(&args[1], snap->angle_y);
-        SETFLOAT(&args[2], snap->angle_z);
+        SETFLOAT(&args[0], witsensor_anglenorm_out(x, snap->angle_x));
+        SETFLOAT(&args[1], witsensor_anglenorm_out(x, snap->angle_y));
+        SETFLOAT(&args[2], witsensor_anglenorm_out(x, snap->angle_z));
         outlet_anything(x->data_out, gensym("angle"), 3, args);
     }
 }
@@ -1694,6 +1718,8 @@ static void *witsensor_new(t_symbol *s, int argc, t_atom *argv) {
     x->dejitter_head = x->dejitter_tail = NULL;
     x->dejitter_count = 0;
     x->dejitter_debug = 0;
+    x->anglenorm_mode = WITSENSOR_ANGLENORM_DEG;
+    x->anglenorm_scale = WITSENSOR_ANGLENORM_SCALE_DEG;
 
     for (int i = 0; i < argc; i++) {
         if (argv[i].a_type == A_SYMBOL) {
@@ -1702,6 +1728,13 @@ static void *witsensor_new(t_symbol *s, int argc, t_atom *argv) {
                 x->stream_dejitter = 1;
             else if (!strcmp(flag, "-listmode") || !strcmp(flag, "-l"))
                 x->stream_listmode = 1;
+            else if (!strcmp(flag, "-nr")) {
+                x->anglenorm_mode = WITSENSOR_ANGLENORM_RAD;
+                x->anglenorm_scale = WITSENSOR_ANGLENORM_SCALE_RAD;
+            } else if (!strcmp(flag, "-n") || !strcmp(flag, "-nc")) {
+                x->anglenorm_mode = WITSENSOR_ANGLENORM_CYCLES;
+                x->anglenorm_scale = WITSENSOR_ANGLENORM_SCALE_CYCLES;
+            }
             else
                 pd_error(x, "witsensor: unknown argument '%s'", flag);
         } else {
