@@ -39,15 +39,30 @@
 #define WIT_CHAR_READ_UUID "0000ffe4-0000-1000-8000-00805f9a34fb"
 #define WIT_CHAR_WRITE_UUID "0000ffe9-0000-1000-8000-00805f9a34fb"
 
-/* Forward: streaming snapshot and de-jitter queue node (full defs after t_queued_streaming) */
-typedef struct _queued_streaming t_queued_streaming;
+/* Forward: de-jitter queue; streaming snapshot struct must precede dejitter node (embedded snap) */
+struct _witsensor;
 typedef struct _dejitter_node t_dejitter_node;
 typedef struct _poll_dejitter_node t_poll_dejitter_node;
+
+typedef struct _queued_streaming {
+    struct _witsensor *owner;
+    int pool_idx; /* 0..WITSENSOR_STREAM_PD_MAX-1 from pool; ignore when snap is embedded copy in dejitter node */
+    float accel_x, accel_y, accel_z;
+    float gyro_x, gyro_y, gyro_z;
+    float disp_x, disp_y, disp_z;
+    float speed_x, speed_y, speed_z;
+    unsigned short ts_lo, ts_hi;
+    float angle_x, angle_y, angle_z;
+    int use_disp_speed;
+    int use_timestamp;
+} t_queued_streaming;
+
 struct _dejitter_node {
-    t_queued_streaming *snap;
+    t_queued_streaming snap;
     struct _dejitter_node *next;
 };
 #define MAX_DEJITTER_QUEUE 64
+#define WITSENSOR_STREAM_PD_MAX 128   /* pool slots; drop frames when no slot (BLE vs Pd) */
 #define DEJITTER_BLE_BURST_HZ 25      /* assumed BLE connection-interval rate */
 
 /* Scaling per WIT protocol: accel /32768*16 → g; gyro /32768*2000 → °/s; mag LSB /150 → µT */
@@ -147,6 +162,11 @@ typedef struct _witsensor {
     // BLE specific
     witsensor_ble_simpleble_t *ble_data;
     
+    /* BLE thread vs Pd: streaming frames queued via pd_queue_mess (__sync_* int) */
+    int stream_pd_inflight;
+    t_queued_streaming stream_snap_pool[WITSENSOR_STREAM_PD_MAX];
+    unsigned char stream_snap_pool_busy[WITSENSOR_STREAM_PD_MAX];
+
     // Pd instance for pd_queue_mess
     t_pdinstance *pd_instance;
     // Autoconnect state: pending_target == NULL → none, "*" → any WIT, else exact match
@@ -167,6 +187,16 @@ static int has_any_pending_target(void) {
     for (t_witsensor *p = s_instances; p; p = p->next_instance)
         if (p->pending_target && !p->is_connected) return 1;
     return 0;
+}
+
+/* Pool slot for streaming snapshot (no malloc in BLE hot path); pairs with stream_pd_inflight */
+static void witsensor_stream_snap_release(t_witsensor *x, t_queued_streaming *snap) {
+    if (!snap || !x) return;
+    if (snap->pool_idx >= 0 && snap->pool_idx < WITSENSOR_STREAM_PD_MAX)
+        x->stream_snap_pool_busy[snap->pool_idx] = 0;
+    else
+        free(snap);
+    __sync_fetch_and_sub(&x->stream_pd_inflight, 1);
 }
 
 // Forward declarations
@@ -231,17 +261,6 @@ static void witsensor_poll_dejitter_clear(t_witsensor *x) {
 typedef struct _queued_datetime {
     int year, month, day, hour, min, sec, ms;
 } t_queued_datetime;
-/* Snapshot of streaming values per packet; avoids overwriting x before Pd handler runs */
-struct _queued_streaming {
-    float accel_x, accel_y, accel_z;
-    float gyro_x, gyro_y, gyro_z;
-    float disp_x, disp_y, disp_z;
-    float speed_x, speed_y, speed_z;
-    unsigned short ts_lo, ts_hi;
-    float angle_x, angle_y, angle_z;
-    int use_disp_speed;
-    int use_timestamp;
-};
 
 static void witsensor_pd_output_handler(t_pd *obj, void *data);
 static void witsensor_pd_streaming_handler(t_pd *obj, void *data);
@@ -293,18 +312,36 @@ static void witsensor_ble_data_callback(void *user_data, unsigned char *data, in
             witsensor_process_register_response(x, x->temp_bytes, PACKET_SIZE);
         } else if (x->temp_bytes[1] == 0x61) {
             witsensor_process_streaming_data(x, x->temp_bytes, PACKET_SIZE);
-            t_queued_streaming *snap = (t_queued_streaming *)malloc(sizeof(t_queued_streaming));
-            if (snap) {
-                snap->accel_x = x->accel_x; snap->accel_y = x->accel_y; snap->accel_z = x->accel_z;
-                snap->gyro_x = x->gyro_x; snap->gyro_y = x->gyro_y; snap->gyro_z = x->gyro_z;
-                snap->disp_x = x->disp_x; snap->disp_y = x->disp_y; snap->disp_z = x->disp_z;
-                snap->speed_x = x->speed_x; snap->speed_y = x->speed_y; snap->speed_z = x->speed_z;
-                snap->ts_lo = x->ts_lo; snap->ts_hi = x->ts_hi;
-                snap->angle_x = x->angle_x; snap->angle_y = x->angle_y; snap->angle_z = x->angle_z;
-                snap->use_disp_speed = x->use_disp_speed;
-                snap->use_timestamp = x->use_timestamp;
-                pd_queue_mess(x->pd_instance, (t_pd *)x, snap, witsensor_pd_streaming_handler);
+            /* Cap + pool: avoid malloc/free per packet (allocator churn → rising CPU over time) */
+            if (__sync_add_and_fetch(&x->stream_pd_inflight, 1) > WITSENSOR_STREAM_PD_MAX) {
+                __sync_fetch_and_sub(&x->stream_pd_inflight, 1);
+                x->temp_bytes_count = 0;
+                continue;
             }
+            t_queued_streaming *snap = NULL;
+            int pi;
+            for (pi = 0; pi < WITSENSOR_STREAM_PD_MAX; pi++) {
+                if (__sync_bool_compare_and_swap(&x->stream_snap_pool_busy[pi], 0, 1)) {
+                    snap = &x->stream_snap_pool[pi];
+                    break;
+                }
+            }
+            if (!snap) {
+                __sync_fetch_and_sub(&x->stream_pd_inflight, 1);
+                x->temp_bytes_count = 0;
+                continue;
+            }
+            snap->owner = x;
+            snap->pool_idx = pi;
+            snap->accel_x = x->accel_x; snap->accel_y = x->accel_y; snap->accel_z = x->accel_z;
+            snap->gyro_x = x->gyro_x; snap->gyro_y = x->gyro_y; snap->gyro_z = x->gyro_z;
+            snap->disp_x = x->disp_x; snap->disp_y = x->disp_y; snap->disp_z = x->disp_z;
+            snap->speed_x = x->speed_x; snap->speed_y = x->speed_y; snap->speed_z = x->speed_z;
+            snap->ts_lo = x->ts_lo; snap->ts_hi = x->ts_hi;
+            snap->angle_x = x->angle_x; snap->angle_y = x->angle_y; snap->angle_z = x->angle_z;
+            snap->use_disp_speed = x->use_disp_speed;
+            snap->use_timestamp = x->use_timestamp;
+            pd_queue_mess(x->pd_instance, (t_pd *)x, snap, witsensor_pd_streaming_handler);
         }
 
         x->temp_bytes_count = 0;
@@ -602,8 +639,9 @@ static void witsensor_process_register_response(t_witsensor *x, unsigned char *d
 // Pd-thread handler to print cached scan results
 void witsensor_pd_scan_complete_handler(t_pd *obj, void *data) {
     (void)data;
+    if (!obj) return;
     t_witsensor *x = (t_witsensor *)obj;
-    if (!x || !x->ble_data) return;
+    if (!x->ble_data) return;
     logpost(x, 3, "WITSensorBLE: Scan complete.");
     // Debug: print adapter info and callback-found count if available
     if (x->ble_data->adapter_id[0] || x->ble_data->adapter_addr[0]) {
@@ -639,9 +677,10 @@ static void output_device_to(t_witsensor *x, t_queued_device *d) {
 
 // Emit device record on Pd thread
 void witsensor_pd_device_found_handler(t_pd *obj, void *data) {
-    t_witsensor *x = (t_witsensor *)obj;
     t_queued_device *d = (t_queued_device *)data;
     if (!d) return;
+    if (!obj) goto cleanup;
+    t_witsensor *x = (t_witsensor *)obj;
     /* Suppress live-scan devices if scan was stopped (callback recipient may not be scan owner) */
     if (d->from_live_scan && !witsensor_ble_simpleble_is_any_scanning())
         goto cleanup;
@@ -854,12 +893,18 @@ static void witsensor_send_sensor_data_from_snapshot(t_witsensor *x, const t_que
 
 // Handle queued streaming snapshots on Pd scheduler thread
 static void witsensor_pd_streaming_handler(t_pd *obj, void *data) {
-    if (!obj || !data) return;
-    t_witsensor *x = (t_witsensor *)obj;
+    if (!data) return;
     t_queued_streaming *snap = (t_queued_streaming *)data;
+    /* pd_queue_cancel: obj is NULL; release pool slot + inflight (see m_pd.h) */
+    if (!obj) {
+        if (snap->owner)
+            witsensor_stream_snap_release(snap->owner, snap);
+        return;
+    }
+    t_witsensor *x = (t_witsensor *)obj;
     if (!x->stream_dejitter) {
         witsensor_send_sensor_data_from_snapshot(x, snap);
-        free(snap);
+        witsensor_stream_snap_release(x, snap);
         return;
     }
     /* Drop oldest if queue is full */
@@ -869,13 +914,16 @@ static void witsensor_pd_streaming_handler(t_pd *obj, void *data) {
             x->dejitter_head = old->next;
             if (!x->dejitter_head) x->dejitter_tail = NULL;
             x->dejitter_count--;
-            free(old->snap);
             free(old);
         }
     }
     t_dejitter_node *node = (t_dejitter_node *)malloc(sizeof(t_dejitter_node));
-    if (!node) { free(snap); return; }
-    node->snap = snap;
+    if (!node) {
+        witsensor_stream_snap_release(x, snap);
+        return;
+    }
+    memcpy(&node->snap, snap, sizeof(t_queued_streaming));
+    witsensor_stream_snap_release(x, snap);
     node->next = NULL;
     if (x->dejitter_tail)
         x->dejitter_tail->next = node;
@@ -898,8 +946,7 @@ static void witsensor_dejitter_tick(t_witsensor *x) {
         x->dejitter_head = node->next;
         if (!x->dejitter_head) x->dejitter_tail = NULL;
         x->dejitter_count--;
-        witsensor_send_sensor_data_from_snapshot(x, node->snap);
-        free(node->snap);
+        witsensor_send_sensor_data_from_snapshot(x, &node->snap);
         free(node);
         if (x->dejitter_debug) {
             t_atom a;
@@ -923,8 +970,7 @@ static void witsensor_dejitter_tick(t_witsensor *x) {
         x->dejitter_head = node->next;
         if (!x->dejitter_head) x->dejitter_tail = NULL;
         x->dejitter_count--;
-        witsensor_send_sensor_data_from_snapshot(x, node->snap);
-        free(node->snap);
+        witsensor_send_sensor_data_from_snapshot(x, &node->snap);
         free(node);
     }
     /* Phase correction: smooth the queue depth to filter out burst jitter,
@@ -946,7 +992,11 @@ static void witsensor_dejitter_tick(t_witsensor *x) {
 
 /* Poll queue handler: add response to dejitter queue; outputs at even intervals */
 static void witsensor_pd_poll_queue_handler(t_pd *obj, void *data) {
-    if (!obj || !data) return;
+    if (!data) return;
+    if (!obj) {
+        free((t_queued_output *)data);
+        return;
+    }
     t_witsensor *x = (t_witsensor *)obj;
     t_queued_output *out = (t_queued_output *)data;
     if (x->poll_dejitter_count >= MAX_POLL_DEJITTER_QUEUE) {
@@ -1018,7 +1068,11 @@ static void witsensor_poll_tick(t_witsensor *x) {
 
 // Handle queued output messages on Pd scheduler thread
 static void witsensor_pd_output_handler(t_pd *obj, void *data) {
-    if (!obj || !data) return;
+    if (!data) return;
+    if (!obj) {
+        free((t_queued_output *)data);
+        return;
+    }
     t_witsensor *x = (t_witsensor *)obj;
     t_queued_output *out = (t_queued_output *)data;
 
@@ -1051,7 +1105,11 @@ static void witsensor_pd_output_handler(t_pd *obj, void *data) {
 
 // Handle parsed RTC date/time on Pd scheduler thread: one "time" message (yyyy mm dd hh mm ss ms)
 static void witsensor_pd_datetime_handler(t_pd *obj, void *data) {
-    if (!obj || !data) return;
+    if (!data) return;
+    if (!obj) {
+        free((t_queued_datetime *)data);
+        return;
+    }
     t_witsensor *x = (t_witsensor *)obj;
     t_queued_datetime *dt = (t_queued_datetime *)data;
     t_atom a[7];
@@ -1068,7 +1126,11 @@ static void witsensor_pd_datetime_handler(t_pd *obj, void *data) {
 
 // Handle connection status changes on Pd scheduler thread
 void witsensor_pd_connected_handler(t_pd *obj, void *data) {
-    if (!obj || !data) return;
+    if (!data) return;
+    if (!obj) {
+        free((t_queued_flag *)data);
+        return;
+    }
     t_witsensor *x = (t_witsensor *)obj;
     t_queued_flag *flag = (t_queued_flag *)data;
     
@@ -1235,7 +1297,6 @@ static void witsensor_dejitter(t_witsensor *x, t_floatarg f) {
     while (x->dejitter_head) {
         t_dejitter_node *node = x->dejitter_head;
         x->dejitter_head = node->next;
-        free(node->snap);
         free(node);
     }
     x->dejitter_tail = NULL;
@@ -1697,6 +1758,8 @@ static void *witsensor_new(t_symbol *s, int argc, t_atom *argv) {
     x->orientation = 0;
     x->temp_bytes_count = 0;
     x->pd_instance = pd_this;
+    x->stream_pd_inflight = 0;
+    memset(x->stream_snap_pool_busy, 0, sizeof(x->stream_snap_pool_busy));
     x->pending_target = NULL;
     x->next_instance = s_instances;
     s_instances = x;
@@ -1781,6 +1844,8 @@ static void witsensor_free(t_witsensor *x) {
     // Disconnect device
     witsensor_disconnect(x);
     pd_queue_cancel((t_pd *)x);
+    x->stream_pd_inflight = 0;
+    memset(x->stream_snap_pool_busy, 0, sizeof(x->stream_snap_pool_busy));
     if (x->ble_data) {
         witsensor_ble_simpleble_destroy(x->ble_data);
     }
@@ -1796,7 +1861,6 @@ static void witsensor_free(t_witsensor *x) {
     while (x->dejitter_head) {
         t_dejitter_node *node = x->dejitter_head;
         x->dejitter_head = node->next;
-        free(node->snap);
         free(node);
     }
     x->dejitter_tail = NULL;

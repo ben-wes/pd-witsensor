@@ -110,8 +110,13 @@ static void simpleble_on_scan_stop(simpleble_adapter_t adapter, void *user_data)
 
 static void simpleble_on_scan_found(simpleble_adapter_t adapter, simpleble_peripheral_t peripheral, void *user_data) {
     (void)adapter;
+    /* simplecble allocates a new Peripheral wrapper per callback (adapter.cpp); must release. */
+    if (!peripheral) return;
     witsensor_ble_simpleble_t *ble_data = (witsensor_ble_simpleble_t *)user_data;
-    if (!ble_data || !peripheral) return;
+    if (!ble_data) {
+        simpleble_peripheral_release_handle(peripheral);
+        return;
+    }
     /* Do NOT return when scan owner is connected: other instances may still need device_found
      * for autoconnect. The Pd handler filters by pending_target and is_device_connected. */
     char *addr = simpleble_peripheral_address(peripheral);
@@ -130,6 +135,7 @@ static void simpleble_on_scan_found(simpleble_adapter_t adapter, simpleble_perip
     }
     if (addr) simpleble_free(addr);
     if (id) simpleble_free(id);
+    simpleble_peripheral_release_handle(peripheral);
 }
 
 
