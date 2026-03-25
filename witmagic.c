@@ -3,13 +3,17 @@
  * Uses Madgwick filter (IMU or AHRS with magnetometer), gravity subtraction, velocity integration.
  *
  * Inlet: list [ax ay az gx gy gz], or accel/gyro (3 floats each). Mag via "mag" message.
- * Units: accel in g (1g = gravity), gyro in °/s, mag in µT (normalized internally). Frame: x right, y front, z up.
+ * Units: accel in g (1g = gravity). Gyro list: values from [witsensor] scaled by turnrange/360 (forward [witsensor] status turnrange into witmagic). Mag in µT. Frame: x right, y front, z up.
  * Mag at lower rate OK: last mag used until new one arrives.
- * Messages: rate, xyzero, magcal, reset, zzero, fusiongain, veldecay.
+ * Messages: rate, xyzero, magcal, reset, zzero, fusiongain, veldecay, turnrange, magsmooth.
+ * turnrange <float> — same as witsensor status (360 = degrees, 2π = rad, 1 = turns on sensor stream); only affects gyro list decoding. Angle outlet is always turns (roll/pitch/yaw).
+ * reset: identity quaternion, zero speed/yaw_offset, clear accel bias and pending xyzero; last mag kept for AHRS (avoids IMU-only yaw drift until next mag). mag cal kept.
+ * Outlets: (0) data — (1) status: mag_recal 0|1 outside mag cal box.
  *
  * Prefer raw witsensor mag + witmagic magcal; skip sensor-side magcal if firmware lags.
- * fusiongain 0.001–1 (default 0.3): Madgwick correction strength. rate 0 = wall-clock dt (good for BLE bursts).
- * acclin = rotated accel − gravity; higher fusiongain → faster tracking. veldecay: speed leak per sample.
+ * fusiongain 0.001–1 (default 0.99): Madgwick correction strength. zzero only shifts displayed yaw (euler); quat outlet is unchanged — use relative quat in Pd if you need heading-zero there too.
+ * magsmooth (default 0.25): EMA on mag after cal — blend weight for new sample; 1 = off.
+ * acclin = rotated accel − gravity; veldecay: speed leak per sample.
  *
  * This is free and unencumbered software released into the public domain.
  */
@@ -27,10 +31,19 @@
 #define DEG2RAD (3.14159265358979323846f / 180.0f)
 #define RAD2DEG (180.0f / 3.14159265358979323846f)
 #define G_TO_MM_S2  9806.65f         /* 1g = 9.80665 m/s² = 9806.65 mm/s² */
-#define WITMAGIC_FUSIONGAIN_DEF  0.3f    /* sensor fusion gain (accel+mag correction) */
+#define WITMAGIC_FUSIONGAIN      0.99f   /* sensor fusion gain (accel+mag correction) */
 #define WITMAGIC_FUSIONGAIN_MIN  0.001f
 #define WITMAGIC_FUSIONGAIN_MAX  1.0f
-#define WITMAGIC_VELDECAY_DEF  0.99f    /* velocity decay per sample (0.5–0.9999) */
+#define WITMAGIC_VELDECAY        0.99f   /* velocity decay per sample (0.5–0.9999) */
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+/* Internal euler is degrees; angle outlet is always in turns */
+#define WITMAGIC_INTERNAL_DEG_TO_TURNS (1.0 / 360.0)
+#define WITMAGIC_TURNRANGE_DEFAULT    360.0  /* matches witsensor default (degrees on stream) */
+#define WITMAG_MAG_SMOOTH   0.25f   /* EMA: weight of new mag sample; 1 = no smoothing */
+
 static t_class *witmagic_class;
 
 typedef struct _witmagic {
@@ -63,10 +76,17 @@ typedef struct _witmagic {
     float mag_cal_max_x, mag_cal_max_y, mag_cal_max_z;
     int mag_cal_count;
     int mag_cal_collecting;
-    float yaw_offset;        /* subtract from yaw so current heading = 0 */
+    float mag_mag_sum;       /* sum |B| during magcal sweep (µT) */
+    float mag_ref_mag;       /* avg |B| at calibration (µT) */
+    int mag_outside_prev;    /* previous raw-sample outside cal box (for mag_recal edges) */
+    float mag_smooth_alpha;  /* EMA blend for new mag (after cal); 1 = bypass */
+    float mag_lp_x, mag_lp_y, mag_lp_z;
+    int mag_lp_valid;
+    float yaw_offset;        /* subtract from yaw so current heading = 0 (internal °) */
+    double turnrange;        /* witsensor one-turn span (360, 2π, 1…); gyro_list = °/s × turnrange/360 */
     
-    /* Outlet: single outlet, named selectors (quat, acclin, speed) */
-    t_outlet *o_out;
+    t_outlet *o_out;         /* data: quat angle acclin speed mag */
+    t_outlet *o_status;      /* mag_recal 0|1 — suggest remagcal when 1 */
 } t_witmagic;
 
 /* Fast inverse sqrt - portable (no strict-aliasing) */
@@ -265,9 +285,21 @@ static double get_time_sec(void) {
 }
 #endif
 
+static void witmagic_turnrange(t_witmagic *x, t_floatarg f) {
+    if (f > 0.f)
+        x->turnrange = (double)f;
+}
+
 /* Core processing: run pipeline for one sample. Calibration uses ax,ay,az when do_calibrate_next. */
 static void witmagic_process(t_witmagic *x, float ax, float ay, float az,
                               float gx, float gy, float gz) {
+    /* witsensor list gyro = (internal °/s) × (turnrange/360) → back to internal °/s */
+    if (x->turnrange > 1e-20) {
+        double gscale = 360.0 / x->turnrange;
+        gx = (float)((double)gx * gscale);
+        gy = (float)((double)gy * gscale);
+        gz = (float)((double)gz * gscale);
+    }
     float dt;
     if (x->rate_hz > 0.f) {
         dt = 1.f / x->rate_hz;
@@ -338,10 +370,10 @@ static void witmagic_process(t_witmagic *x, float ax, float ay, float az,
     yaw -= x->yaw_offset;
     while (yaw > 180.f) yaw -= 360.f;
     while (yaw < -180.f) yaw += 360.f;
-    /* euler: roll pitch yaw (x y z) — x=right, y=front, z=up; 3rd value = yaw */
-    SETFLOAT(out + 0, roll);
-    SETFLOAT(out + 1, pitch);
-    SETFLOAT(out + 2, yaw);
+    /* euler: roll pitch yaw (x y z) — always turns */
+    SETFLOAT(out + 0, (t_float)(roll * WITMAGIC_INTERNAL_DEG_TO_TURNS));
+    SETFLOAT(out + 1, (t_float)(pitch * WITMAGIC_INTERNAL_DEG_TO_TURNS));
+    SETFLOAT(out + 2, (t_float)(yaw * WITMAGIC_INTERNAL_DEG_TO_TURNS));
     outlet_anything(x->o_out, gensym("angle"), 3, out);
     SETFLOAT(out + 0, ad_x);
     SETFLOAT(out + 1, ad_y);
@@ -358,7 +390,7 @@ static void witmagic_process(t_witmagic *x, float ax, float ay, float az,
     outlet_anything(x->o_out, gensym("mag"), 3, out);
 }
 
-/* List: [ax ay az gx gy gz] (accel g, gyro deg/s). Mag via separate "mag" message. */
+/* List: [ax ay az gx gy gz] (accel g, gyro per witsensor turnrange). Mag via separate "mag" message. */
 static void witmagic_list(t_witmagic *x, t_symbol *s, int argc, t_atom *argv) {
     (void)s;
     if (argc < 6) return;
@@ -396,6 +428,8 @@ static void witmagic_mag(t_witmagic *x, t_symbol *s, int argc, t_atom *argv) {
     float my = atom_getfloat(argv + 1);
     float mz = atom_getfloat(argv + 2);
     if (x->mag_cal_collecting) {
+        float bm = sqrtf(mx * mx + my * my + mz * mz);
+        x->mag_mag_sum += bm;
         if (x->mag_cal_count == 0) {
             x->mag_cal_min_x = x->mag_cal_max_x = mx;
             x->mag_cal_min_y = x->mag_cal_max_y = my;
@@ -410,6 +444,7 @@ static void witmagic_mag(t_witmagic *x, t_symbol *s, int argc, t_atom *argv) {
         }
         x->mag_cal_count++;
     } else {
+        float raw_mx = mx, raw_my = my, raw_mz = mz;
         if (x->mag_cal_valid) {
             float sx = (x->mag_scale_x > 1e-6f) ? x->mag_scale_x : 1.f;
             float sy = (x->mag_scale_y > 1e-6f) ? x->mag_scale_y : 1.f;
@@ -418,10 +453,42 @@ static void witmagic_mag(t_witmagic *x, t_symbol *s, int argc, t_atom *argv) {
             my = (my - x->mag_offset_y) / sy;
             mz = (mz - x->mag_offset_z) / sz;
         }
+        /* EMA low-pass (after cal): out = a*new + (1-a)*prev; a=1 → no smoothing */
+        {
+            float a = x->mag_smooth_alpha;
+            if (a < 1.f - 1e-6f) {
+                if (x->mag_lp_valid) {
+                    mx = a * mx + (1.f - a) * x->mag_lp_x;
+                    my = a * my + (1.f - a) * x->mag_lp_y;
+                    mz = a * mz + (1.f - a) * x->mag_lp_z;
+                }
+                x->mag_lp_x = mx;
+                x->mag_lp_y = my;
+                x->mag_lp_z = mz;
+                x->mag_lp_valid = 1;
+            } else {
+                x->mag_lp_x = mx;
+                x->mag_lp_y = my;
+                x->mag_lp_z = mz;
+                x->mag_lp_valid = 1;
+            }
+        }
         x->mag_x = mx;
         x->mag_y = my;
         x->mag_z = mz;
         x->mag_valid = 1;
+
+        if (x->mag_cal_valid) {
+            int outside = (raw_mx < x->mag_cal_min_x || raw_mx > x->mag_cal_max_x
+                || raw_my < x->mag_cal_min_y || raw_my > x->mag_cal_max_y
+                || raw_mz < x->mag_cal_min_z || raw_mz > x->mag_cal_max_z);
+            if (outside != x->mag_outside_prev) {
+                t_atom st;
+                SETFLOAT(&st, outside ? 1.f : 0.f);
+                outlet_anything(x->o_status, gensym("mag_recal"), 1, &st);
+                x->mag_outside_prev = outside;
+            }
+        }
     }
 }
 
@@ -429,7 +496,9 @@ static void witmagic_magcal(t_witmagic *x, t_floatarg f) {
     if (f != 0.f) {
         x->mag_cal_collecting = 1;
         x->mag_cal_count = 0;
+        x->mag_mag_sum = 0.f;
         x->mag_cal_valid = 0;
+        x->mag_lp_valid = 0;
         post("witmagic: magcal started — rotate sensor through all orientations, then magcal 0");
     } else {
         x->mag_cal_collecting = 0;
@@ -443,10 +512,14 @@ static void witmagic_magcal(t_witmagic *x, t_floatarg f) {
             if (x->mag_scale_x < 1e-6f) x->mag_scale_x = 1.f;
             if (x->mag_scale_y < 1e-6f) x->mag_scale_y = 1.f;
             if (x->mag_scale_z < 1e-6f) x->mag_scale_z = 1.f;
+            x->mag_ref_mag = x->mag_mag_sum / (float)x->mag_cal_count;
+            x->mag_outside_prev = 0;
             x->mag_cal_valid = 1;
-            post("witmagic: mag min-max cal done — offset (%.1f %.1f %.1f) scale (%.1f %.1f %.1f) (%d samples)",
+            x->mag_lp_valid = 0;
+            post("witmagic: mag min-max cal done — offset (%.1f %.1f %.1f) scale (%.1f %.1f %.1f) |B|_ref=%.1f µT (%d samples)",
                  x->mag_offset_x, x->mag_offset_y, x->mag_offset_z,
-                 x->mag_scale_x, x->mag_scale_y, x->mag_scale_z, x->mag_cal_count);
+                 x->mag_scale_x, x->mag_scale_y, x->mag_scale_z,
+                 x->mag_ref_mag, x->mag_cal_count);
         } else {
             post("witmagic: magcal stopped — no samples collected");
         }
@@ -479,6 +552,12 @@ static void witmagic_fusiongain(t_witmagic *x, t_floatarg f) {
     if (f >= WITMAGIC_FUSIONGAIN_MIN && f <= WITMAGIC_FUSIONGAIN_MAX) x->fusiongain = f;
 }
 
+static void witmagic_magsmooth(t_witmagic *x, t_floatarg f) {
+    float a = (float)f;
+    x->mag_smooth_alpha = (a >= 1.f) ? 1.f : a;
+    x->mag_lp_valid = 0;
+}
+
 static void witmagic_veldecay(t_witmagic *x, t_floatarg f) {
     if (f >= 0.5f && f <= 0.9999f) x->veldecay = f;
 }
@@ -495,22 +574,31 @@ static void witmagic_reset(t_witmagic *x) {
     x->vx = x->vy = x->vz = 0.f;
     x->yaw_offset = 0.f;
     x->first_sample = 1;
+    x->last_time = 0.0;
+    x->bias_ax = x->bias_ay = x->bias_az = 0.f;
+    x->bias_valid = 0;
+    x->do_calibrate_next = 0;
+    /* Keep last mag + mag_valid: clearing forced IMU-only until next mag poll → bad yaw drift after reset. */
+    x->mag_outside_prev = 0;
+    x->mag_lp_valid = 0;
 }
 
-/* zzero: set current heading as 0. Accel/mag keep correcting; only yaw reference changes. */
+/* zzero: displayed yaw → 0 (subtract euler yaw); quaternion unchanged — quat outlet still absolute. */
 static void witmagic_zzero(t_witmagic *x) {
     float yaw, pitch, roll;
     quat_to_euler(x->qw, x->qx, x->qy, x->qz, &yaw, &pitch, &roll);
+    while (yaw > 180.f) yaw -= 360.f;
+    while (yaw < -180.f) yaw += 360.f;
     x->yaw_offset = yaw;
-    post("witmagic: yaw offset set to %.1f° (current heading = 0)", yaw);
+    post("witmagic: yaw offset set to %.1f° (angle yaw 0; quat outlet unchanged)", yaw);
 }
 
 static void *witmagic_new(void) {
     t_witmagic *x = (t_witmagic *)pd_new(witmagic_class);
     x->qw = 1.f;
     x->qx = x->qy = x->qz = 0.f;
-    x->fusiongain = WITMAGIC_FUSIONGAIN_DEF;
-    x->veldecay = WITMAGIC_VELDECAY_DEF;
+    x->fusiongain = WITMAGIC_FUSIONGAIN;
+    x->veldecay = WITMAGIC_VELDECAY;
     x->bias_ax = x->bias_ay = x->bias_az = 0.f;
     x->bias_valid = 0;
     x->do_calibrate_next = 0;
@@ -526,9 +614,17 @@ static void *witmagic_new(void) {
     x->mag_cal_valid = 0;
     x->mag_cal_collecting = 0;
     x->mag_cal_count = 0;
+    x->mag_mag_sum = 0.f;
+    x->mag_ref_mag = 0.f;
+    x->mag_outside_prev = 0;
+    x->mag_smooth_alpha = WITMAG_MAG_SMOOTH;
+    x->mag_lp_x = x->mag_lp_y = x->mag_lp_z = 0.f;
+    x->mag_lp_valid = 0;
     x->yaw_offset = 0.f;
+    x->turnrange = WITMAGIC_TURNRANGE_DEFAULT;
 
     x->o_out = outlet_new(&x->x_obj, &s_anything);
+    x->o_status = outlet_new(&x->x_obj, &s_anything);
     return (void *)x;
 }
 
@@ -542,7 +638,9 @@ void witmagic_setup(void) {
     class_addmethod(witmagic_class, (t_method)witmagic_rate, gensym("rate"), A_DEFFLOAT, 0);
     class_addmethod(witmagic_class, (t_method)witmagic_xyzero, gensym("xyzero"), 0);
     class_addmethod(witmagic_class, (t_method)witmagic_fusiongain, gensym("fusiongain"), A_DEFFLOAT, 0);
+    class_addmethod(witmagic_class, (t_method)witmagic_magsmooth, gensym("magsmooth"), A_DEFFLOAT, 0);
     class_addmethod(witmagic_class, (t_method)witmagic_veldecay, gensym("veldecay"), A_DEFFLOAT, 0);
+    class_addmethod(witmagic_class, (t_method)witmagic_turnrange, gensym("turnrange"), A_DEFFLOAT, 0);
     class_addmethod(witmagic_class, (t_method)witmagic_reset, gensym("reset"), 0);
     class_addmethod(witmagic_class, (t_method)witmagic_zzero, gensym("zzero"), 0);
     class_addmethod(witmagic_class, (t_method)witmagic_magcal, gensym("magcal"), A_DEFFLOAT, 0);
