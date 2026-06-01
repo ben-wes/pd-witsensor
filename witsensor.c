@@ -16,8 +16,33 @@
     #include <unistd.h>
     #include <pthread.h>
 #endif
+#if defined(_MSC_VER)
+    #ifndef _WIN32_WINNT
+    #define _WIN32_WINNT 0x0A00
+    #endif
+    #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <windows.h>
+#endif
 
 #include "m_pd.h"
+
+/* GCC __sync_* atomics (BLE thread vs Pd); MSVC uses Interlocked* */
+#if defined(_MSC_VER)
+#define witsensor_sync_add_and_fetch(p) \
+    ((int)InterlockedIncrement((volatile LONG *)(p)))
+#define witsensor_sync_fetch_and_sub(p, n) \
+    ((void)(n), (int)InterlockedDecrement((volatile LONG *)(p)))
+#define witsensor_sync_bool_cas_int(p, expected, desired) \
+    (InterlockedCompareExchange((volatile LONG *)(p), (LONG)(desired), (LONG)(expected)) \
+        == (LONG)(expected))
+#else
+#define witsensor_sync_add_and_fetch(p) __sync_add_and_fetch((p), 1)
+#define witsensor_sync_fetch_and_sub(p, n) __sync_fetch_and_sub((p), (n))
+#define witsensor_sync_bool_cas_int(p, expected, desired) \
+    __sync_bool_compare_and_swap((p), (expected), (desired))
+#endif
 
 // BLE includes
 #include "witsensor_ble_simpleble.h"
@@ -162,10 +187,10 @@ typedef struct _witsensor {
     // BLE specific
     witsensor_ble_simpleble_t *ble_data;
     
-    /* BLE thread vs Pd: streaming frames queued via pd_queue_mess (__sync_* int) */
+    /* BLE thread vs Pd: streaming frames queued via pd_queue_mess (atomics on inflight/pool) */
     int stream_pd_inflight;
     t_queued_streaming stream_snap_pool[WITSENSOR_STREAM_PD_MAX];
-    unsigned char stream_snap_pool_busy[WITSENSOR_STREAM_PD_MAX];
+    int stream_snap_pool_busy[WITSENSOR_STREAM_PD_MAX]; /* 0/1 slots; int for InterlockedCompareExchange */
 
     // Pd instance for pd_queue_mess
     t_pdinstance *pd_instance;
@@ -196,7 +221,7 @@ static void witsensor_stream_snap_release(t_witsensor *x, t_queued_streaming *sn
         x->stream_snap_pool_busy[snap->pool_idx] = 0;
     else
         free(snap);
-    __sync_fetch_and_sub(&x->stream_pd_inflight, 1);
+    witsensor_sync_fetch_and_sub(&x->stream_pd_inflight, 1);
 }
 
 // Forward declarations
@@ -313,21 +338,21 @@ static void witsensor_ble_data_callback(void *user_data, unsigned char *data, in
         } else if (x->temp_bytes[1] == 0x61) {
             witsensor_process_streaming_data(x, x->temp_bytes, PACKET_SIZE);
             /* Cap + pool: avoid malloc/free per packet (allocator churn → rising CPU over time) */
-            if (__sync_add_and_fetch(&x->stream_pd_inflight, 1) > WITSENSOR_STREAM_PD_MAX) {
-                __sync_fetch_and_sub(&x->stream_pd_inflight, 1);
+            if (witsensor_sync_add_and_fetch(&x->stream_pd_inflight) > WITSENSOR_STREAM_PD_MAX) {
+                witsensor_sync_fetch_and_sub(&x->stream_pd_inflight, 1);
                 x->temp_bytes_count = 0;
                 continue;
             }
             t_queued_streaming *snap = NULL;
             int pi;
             for (pi = 0; pi < WITSENSOR_STREAM_PD_MAX; pi++) {
-                if (__sync_bool_compare_and_swap(&x->stream_snap_pool_busy[pi], 0, 1)) {
+                if (witsensor_sync_bool_cas_int(&x->stream_snap_pool_busy[pi], 0, 1)) {
                     snap = &x->stream_snap_pool[pi];
                     break;
                 }
             }
             if (!snap) {
-                __sync_fetch_and_sub(&x->stream_pd_inflight, 1);
+                witsensor_sync_fetch_and_sub(&x->stream_pd_inflight, 1);
                 x->temp_bytes_count = 0;
                 continue;
             }

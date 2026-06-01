@@ -42,7 +42,7 @@ define forWindows
 	# Add Windows-specific include path for SimpleBLE
 	cflags += -I./SimpleBLE/simplecble/build-windows/export
 	# Link against MinGW-built SimpleBLE libraries
-	ldlibs += -L./SimpleBLE/simplecble/build-windows/lib -lsimpleble -lws2_32 -liphlpapi -lole32 -lsetupapi
+	ldlibs += -L./SimpleBLE/simplecble/build-windows/lib -lsimplecble -lsimpleble -lws2_32 -liphlpapi -lole32 -lsetupapi
 endef
 
 # data files

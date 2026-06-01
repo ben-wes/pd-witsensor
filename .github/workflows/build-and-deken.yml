@@ -140,26 +140,23 @@ jobs:
           
           $outFile = "${outDir}\witsensor.${extension}"
           
-          # Set compiler flags - only use PDINSTANCE for 64-bit builds
+          # PD_FLOATSIZE = Pd t_float width; PDINSTANCE only for 64-bit float builds
           $pdFlags = if (${{ matrix.floatsize }} -eq 64) { "/DPD /DPDINSTANCE /DPD_FLOATSIZE=64" } else { "/DPD /DPD_FLOATSIZE=32" }
           
-          # Determine Pd library name (pd.lib for 32-bit, pd64.lib for 64-bit)
           $pdLib = if (${{ matrix.floatsize }} -eq 64) { "pd64.lib" } else { "pd.lib" }
           
-          # Compile source files with MSVC
           cl /nologo $pdFlags `
             /I. /I"SimpleBLE/simplecble/include" /I"SimpleBLE/simpleble/include" `
             /I"SimpleBLE/simplecble/build-windows/export" `
             /I"${pdDir}/src" `
             /O2 /W3 /LD /MD `
-            /DPD_FLOATSIZE=${{ matrix.floatsize }} `
             witsensor.c witsensor_ble_simpleble.c `
             /link /DLL "/OUT:${outFile}" `
-            "/LIBPATH:${pdDir}/bin" $pdLib `
-            "SimpleBLE/simplecble/build-windows/lib/Release/simpleble.lib" `
-            "SimpleBLE/simplecble/build-windows/lib/Release/simplecble.lib" `
+            "/LIBPATH:${pdDir}/bin" "/LIBPATH:SimpleBLE/simplecble/build-windows/lib/Release" $pdLib `
+            simplecble.lib simpleble.lib `
             ws2_32.lib iphlpapi.lib ole32.lib setupapi.lib windowsapp.lib `
             legacy_stdio_definitions.lib ucrt.lib vcruntime.lib msvcrt.lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           # Copy help files
           Copy-Item "witsensor-help.pd" "$outDir\"
